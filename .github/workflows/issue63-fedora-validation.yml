@@ -79,12 +79,17 @@ jobs:
             result=$?
             trap - EXIT INT TERM
             if test "$result" -ne 0; then
+              if test "$phase" = fedora-boot; then
+                sudo journalctl --kernel --no-pager -n 200 \
+                  --grep='apparmor="DENIED".*(qemu|/dev/kvm)|comm="qemu-system' 2>&1 | \
+                  tee "$work/kvm-audit.raw" > /dev/null || true
+              fi
               python3 - "$work" "$phase" <<'PY'
           import pathlib, re, sys
           root = pathlib.Path(sys.argv[1])
           files = {
               'host-tools': ['apt.raw'], 'verified-downloads': ['gpg.raw', 'compose-download.raw'],
-              'fedora-boot': ['qemu.raw', 'ssh.raw', 'cloud-init.raw'],
+              'fedora-boot': ['qemu.raw', 'ssh.raw', 'cloud-init.raw', 'kvm-audit.raw'],
               'fedora-bootstrap': ['scp.raw', 'bootstrap.raw', 'extract.raw'],
               'real-podman-acceptance': ['proof.raw'],
           }.get(sys.argv[2], [])
@@ -208,7 +213,25 @@ jobs:
           qemu-img create -q -f qcow2 -F qcow2 -b "$work/$image" "$work/vm.qcow2" 20G
           phase=fedora-boot
           printf 'FEDORA_STAGE=%s\n' "$phase"
-          qemu-system-x86_64 -name spaceapp-fedora-validation -machine q35,accel=kvm -cpu host \
+          printf 'QEMU_PATH=%s\n' "$(command -v qemu-system-x86_64)"
+          /usr/bin/qemu-system-x86_64 --version
+          # Settle pending device events and recheck access at the actual launch boundary.
+          sudo udevadm settle --timeout=30
+          getfacl --absolute-names /dev/kvm
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          getfacl --absolute-names /dev/kvm
+          python3 - <<'PY'
+          import fcntl, os, pathlib
+          print('KVM_RUNNER_EUID=' + str(os.geteuid()))
+          print('KVM_RUNNER_LSM=' + pathlib.Path('/proc/self/attr/current').read_text().strip())
+          fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
+          assert fcntl.ioctl(fd, 0xAE00, 0) == 12
+          vm = fcntl.ioctl(fd, 0xAE01, 0)
+          os.close(vm)
+          os.close(fd)
+          print('KVM_RUNNER_API=12 KVM_CREATE_VM=passed')
+          PY
+          /usr/bin/qemu-system-x86_64 -name spaceapp-fedora-validation -machine q35,accel=kvm -cpu host \
             -smp 4 -m 12288 -display none -monitor none -serial "file:$work/serial.raw" -no-reboot \
             -drive "file=$work/vm.qcow2,if=virtio,format=qcow2,discard=unmap" \
             -drive "file=$work/seed.iso,if=virtio,format=raw,readonly=on" \
@@ -249,8 +272,12 @@ jobs:
           printf '[Service]\nDelegate=cpu cpuset io memory pids\n' > /etc/systemd/system/user@.service.d/delegate.conf
           systemctl daemon-reload
           loginctl enable-linger fedora
-          systemctl start "user@$(id -u fedora).service"
-          systemctl set-property "user@$(id -u fedora).service" Delegate=yes
+          systemctl restart "user@$(id -u fedora).service"
+          test "$(systemctl show "user@$(id -u fedora).service" --property=Delegate --value)" = yes
+          user_cgroup=$(systemctl show "user@$(id -u fedora).service" --property=ControlGroup --value)
+          test -n "$user_cgroup"
+          grep -qw cpu "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
+          grep -qw memory "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
           test "$(getenforce)" = Enforcing
           EOF
           cat > "$work/run-proof.sh" <<'EOF'

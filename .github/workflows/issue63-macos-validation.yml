@@ -97,7 +97,9 @@ jobs:
           echo "ed6fc5b060ec8d1b9d84cf19725851a3e37480b5003f9c1cafa34b1adfad4de6  $package" | shasum -a 256 --check
           pkgutil --check-signature "$package" > "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
           cat "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
-          grep -q 'Status: signed by a certificate trusted' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          grep -q 'Status: signed by a developer certificate issued by Apple for distribution' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          grep -q 'Notarization: trusted by the Apple notary service' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          grep -Fq 'Developer ID Installer: Red Hat, Inc. (HYSCB8KRL2)' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
           node "$RUNNER_TEMP/spaceapp-bounded.mjs" 60000 sudo /usr/sbin/installer -pkg "$package" -target /
           export PATH="/opt/podman/bin:$PATH"
           echo /opt/podman/bin >> "$GITHUB_PATH"
