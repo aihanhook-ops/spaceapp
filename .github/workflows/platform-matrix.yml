@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - codex/issue63-linux-validation
   workflow_dispatch:
     inputs:
       jobs:
@@ -153,8 +154,8 @@ jobs:
         shell: bash
         env:
           ACCEPTANCE_PROFILE: ${{ inputs.profile || 'small' }}
-          SOURCE_VERSION: ${{ inputs.source_version }}
-          TARGET_VERSION: ${{ inputs.target_version }}
+          SOURCE_VERSION: ${{ inputs.source_version || '1.1.4' }}
+          TARGET_VERSION: ${{ inputs.target_version || '1.1.5' }}
         run: |
           args=(--profile "$ACCEPTANCE_PROFILE" --state-file "$RUNNER_TEMP/spaceapp-podman-state.json")
           if test -n "$SOURCE_VERSION"; then args+=(--source-version "$SOURCE_VERSION"); fi
