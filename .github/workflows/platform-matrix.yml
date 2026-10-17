@@ -134,8 +134,18 @@ jobs:
           grep -qw memory "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
           mkdir -p "$XDG_RUNTIME_DIR/podman"
           # Use this binary, not the distro unit's older /usr/bin/podman.
+          podman_binary=$(readlink -f "$(command -v podman)")
+          echo "$podman_binary"
+          if test "$podman_binary" != /usr/bin/podman; then
+            [[ "$podman_binary" =~ ^/home/linuxbrew/\.linuxbrew/Cellar/podman/[0-9]+(\.[0-9]+){2}(_[0-9]+)?/bin/podman$ ]] || { echo "Unexpected Podman binary: $podman_binary" >&2; exit 1; }
+            # Ubuntu's packaged userns allowance only attaches to /usr/bin/podman.
+            printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile spaceapp-ci-podman %s flags=(unconfined) {\n  userns,\n}\n' "$podman_binary" | \
+              sudo tee /etc/apparmor.d/spaceapp-ci-podman > /dev/null
+            sudo apparmor_parser -r /etc/apparmor.d/spaceapp-ci-podman
+          fi
+          podman_api_started=$(date --iso-8601=seconds)
           systemd-run --user --unit=spaceapp-podman-api --property=Delegate=yes \
-            "$(command -v podman)" system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+            "$podman_binary" system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock"
           for _ in $(seq 1 30); do
             test ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" || break
             sleep 1
@@ -144,9 +154,11 @@ jobs:
             systemctl --user show spaceapp-podman-api.service \
               --property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus || true
             journalctl --user --unit=spaceapp-podman-api.service --boot --no-pager --lines=100 || true
+            sudo journalctl -k --boot --since "$podman_api_started" --no-pager --lines=100 \
+              --grep='apparmor="DENIED".*(comm="podman"|name="/proc/self/exe")' || true
             exit 1
           fi
-          podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupVersion}} {{.Host.CgroupControllers}}'
+          podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupsVersion}} {{.Host.CgroupControllers}}'
 
       - name: Install the supported Compose provider
         shell: bash
