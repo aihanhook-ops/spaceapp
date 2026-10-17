@@ -18,7 +18,7 @@ jobs:
     if: github.event.repository.private == false
     # Standard public-repository runner; no paid/larger runner label.
     runs-on: macos-15-intel
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       SPACEAPP_MACHINE: spaceapp-ci-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_COMPOSE_PROVIDER: docker-compose
@@ -180,7 +180,58 @@ jobs:
             exit "$boot_status"
           fi
 
+      - name: Time only the resolved small source-image pulls
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/spaceapp-source-prepull.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          import {mkdtemp,rm} from 'node:fs/promises';
+          import {homedir} from 'node:os';
+          import {join,resolve} from 'node:path';
+          import {pathToFileURL} from 'node:url';
+          const {initializeInstallation,composeCommand}=await import(pathToFileURL(resolve('packages/run-spaceapp/src/index.mjs')));
+          const fixture=await mkdtemp(join(homedir(),'.spaceapp-macos-prepull-'));
+          try{
+            const {config}=await initializeInstallation(fixture,{version:'1.1.4',profile:'small',engine:'podman',accessMode:'isolated',companionsEnabled:false});
+            const spec=composeCommand('status',fixture,config);
+            const args=[...spec.args.slice(0,-1),'config','--format','json'];
+            const env={...process.env,...spec.env};
+            let model;
+            try{model=JSON.parse(execFileSync(spec.command,args,{env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:4*1024*1024}));}
+            catch{throw new Error('Source Compose configuration resolution failed; model output is not logged');}
+            const profiles=new Set(spec.args.flatMap((arg,index)=>arg==='--profile'?[spec.args[index+1]]:[]));
+            const active=Object.values(model.services).filter(service=>!service.profiles?.length||service.profiles.some(profile=>profiles.has(profile)));
+            const images=[...new Set(active.map(service=>service.image))];
+            const expected=['spaceapp-core','spaceapp-cli','postgres'].map(name=>model.services[name]?.image);
+            assert.equal(images.length,3,'Unexpected additional small-profile image');
+            assert(expected.every(image=>typeof image==='string'&&images.includes(image)));
+            assert.match(model.services['spaceapp-core'].image,/^ghcr\.io\/oll4com\/spaceapp-core:1\.1\.4$/);
+            assert.match(model.services['spaceapp-cli'].image,/^ghcr\.io\/oll4com\/spaceapp-cli:1\.1\.4$/);
+            assert.match(model.services.postgres.image,/@sha256:[a-f0-9]{64}$/);
+            const deadline=Date.now()+7*60*1000;
+            for(const image of images){
+              const started=Date.now(); const budget=Math.min(4*60*1000,deadline-started);
+              assert(budget>0,'Seven-minute source pre-pull budget exhausted');
+              console.log(JSON.stringify({mode:'MACOS_SOURCE_PULL',image,event:'start',at:new Date(started).toISOString(),limitMs:budget}));
+              try{
+                const output=execFileSync(process.execPath,[join(process.env.RUNNER_TEMP,'spaceapp-bounded.mjs'),String(budget),'podman','pull',image],{env,encoding:'utf8',maxBuffer:32*1024,stdio:['ignore','pipe','pipe']});
+                if(output.trim())console.log(output.slice(-2000));
+              }catch(error){
+                console.log((String(error.stdout??'')+String(error.stderr??'')).slice(-2000));
+                console.log(JSON.stringify({mode:'MACOS_SOURCE_PULL',image,event:'failed',at:new Date().toISOString(),elapsedMs:Date.now()-started,code:error.status??null}));
+                throw new Error('Source-image preparation failed; application acceptance was not attempted');
+              }
+              console.log(JSON.stringify({mode:'MACOS_SOURCE_PULL',image,event:'complete',at:new Date().toISOString(),elapsedMs:Date.now()-started}));
+            }
+          }finally{await rm(fixture,{recursive:true,force:true});}
+          NODE
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 450000 node "$RUNNER_TEMP/spaceapp-source-prepull.mjs"
+
       - name: Run the macOS launcher against the actual Podman machine
+        id: acceptance
         timeout-minutes: 18
         shell: bash
         run: |
@@ -189,6 +240,34 @@ jobs:
             packages/run-spaceapp/tests/podman-acceptance.mjs --profile small \
             --source-version 1.1.4 --target-version 1.1.5 \
             --state-file "$RUNNER_TEMP/spaceapp-macos-state.json"
+
+      - name: Capture bounded project states after acceptance failure
+        if: failure() && steps.acceptance.outcome == 'failure'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          import {readFile} from 'node:fs/promises';
+          import {homedir} from 'node:os';
+          import {basename,dirname,join,resolve} from 'node:path';
+          import {pathToFileURL} from 'node:url';
+          const at=new Date().toISOString();
+          try{
+            const {composeProjectName}=await import(pathToFileURL(resolve('packages/run-spaceapp/src/index.mjs')));
+            const state=JSON.parse(await readFile(join(process.env.RUNNER_TEMP,'spaceapp-macos-state.json'),'utf8'));
+            assert.equal(dirname(state.root),homedir());
+            assert(basename(state.root).startsWith('.spaceapp-podman-acceptance-'));
+            assert.equal(state.project,composeProjectName(join(state.root,'installation')));
+            const output=execFileSync('podman',['ps','-a','--filter',`label=com.docker.compose.project=${state.project}`,'--format','json'],{encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:1024*1024,stdio:['ignore','pipe','pipe']});
+            const containers=JSON.parse(output);
+            assert(Array.isArray(containers)&&containers.length<=20);
+            console.log(JSON.stringify({mode:'MACOS_PROJECT_SNAPSHOT',at,project:state.project,containers:containers.map(item=>({id:item.Id??item.ID,names:item.Names,state:item.State,status:item.Status,exitCode:Number.isInteger(item.ExitCode)?item.ExitCode:null}))}));
+          }catch{
+            console.log(JSON.stringify({mode:'MACOS_PROJECT_SNAPSHOT',at,available:false,reason:'State already cleaned or bounded engine query unavailable; no inference about the original failure'}));
+          }
+          NODE
 
       - name: Always remove only this proof's project, fixture and named machine
         if: always()
