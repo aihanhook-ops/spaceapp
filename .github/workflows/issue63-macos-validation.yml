@@ -57,7 +57,7 @@ jobs:
             clearTimeout(timer);
             const safe = output.replace(/^.*(?:setup.?token|password|secret|postgres(?:ql)?:\/\/).*$/gim,'[redacted]');
             if (safe) process.stdout.write(safe.endsWith('\n') ? safe : safe + '\n');
-            if (expired) console.error(`Bounded command exceeded ${milliseconds}ms; experimental environment did not complete.`);
+            if (expired) console.error(`Bounded command exceeded ${milliseconds}ms at ${new Date().toISOString()}; experimental environment did not complete.`);
             else if (signal) console.error(`Bounded command terminated by ${signal}`);
             process.exitCode = expired ? 124 : code ?? 1;
           });
@@ -128,8 +128,8 @@ jobs:
           fi
           docker-compose version
 
-      - name: Bound default-provider VM initialization, boot, SSH and home share to five minutes
-        timeout-minutes: 5
+      - name: Bound VM initialization separately from native boot, SSH and home share
+        timeout-minutes: 11
         shell: bash
         run: |
           set -euo pipefail
@@ -141,26 +141,44 @@ jobs:
           import {join} from 'node:path';
           const machine=process.env.SPACEAPP_MACHINE;
           assert(/^spaceapp-ci-\d+-\d+$/.test(machine));
+          const stage=process.argv[2];
+          assert(['initialize','boot'].includes(stage));
+          const started=Date.now();
+          console.log(JSON.stringify({mode:'MACOS_MACHINE_STAGE',stage,event:'start',at:new Date(started).toISOString()}));
           const capture=(...args)=>execFileSync('podman',args,{encoding:'utf8',maxBuffer:1024*1024});
           const run=(...args)=>execFileSync('podman',args,{stdio:'inherit'});
-          assert.equal(JSON.parse(capture('machine','list','--format','json')).length,0,'Refusing to change an existing machine/default connection');
-          // No provider override, TCG substitute, helper socket or rootful engine.
-          run('machine','init','--cpus','4','--memory','9216','--disk-size','30','--rootful=false',machine);
-          run('machine','start',machine);
-          assert.equal(capture('machine','ssh',machine,'uname','-s').trim(),'Linux','Guest SSH did not answer');
-          const marker=join(homedir(),`.spaceapp-macos-bind-${machine}`);
-          writeFileSync(marker,machine,{mode:0o600,flag:'wx'});
-          assert.equal(capture('machine','ssh',machine,'cat',marker).trim(),machine,'Default macOS home bind is not accessible in the machine');
-          const info=JSON.parse(capture('info','--format','json'));
-          assert.equal(info.host?.security?.rootless,true);
-          const selected=JSON.parse(capture('machine','list','--format','json')).find(item=>item.Name===machine);
-          assert(selected?.Running && selected?.Default,'The fresh running machine must be the selected default');
-          const disk=statfsSync(homedir()); const free=Number(disk.bavail)*Number(disk.bsize);
-          assert(free>=6.5*1024**3,'Insufficient actual macOS free disk after VM creation');
-          console.log(JSON.stringify({mode:'MACOS_MACHINE_READY',machine,vmType:selected.VMType,rootless:true,ssh:true,homeBind:true,hostFreeDiskBytes:free}));
+          if(stage==='initialize'){
+            assert.equal(JSON.parse(capture('machine','list','--format','json')).length,0,'Refusing to change an existing machine/default connection');
+            // No provider override, TCG substitute, helper socket or rootful engine.
+            run('machine','init','--cpus','4','--memory','9216','--disk-size','30','--rootful=false',machine);
+          }else{
+            run('machine','start',machine);
+            assert.equal(capture('machine','ssh',machine,'uname','-s').trim(),'Linux','Guest SSH did not answer');
+            const marker=join(homedir(),`.spaceapp-macos-bind-${machine}`);
+            writeFileSync(marker,machine,{mode:0o600,flag:'wx'});
+            assert.equal(capture('machine','ssh',machine,'cat',marker).trim(),machine,'Default macOS home bind is not accessible in the machine');
+            const info=JSON.parse(capture('info','--format','json'));
+            assert.equal(info.host?.security?.rootless,true);
+            const selected=JSON.parse(capture('machine','list','--format','json')).find(item=>item.Name===machine);
+            assert(selected?.Running && selected?.Default,'The fresh running machine must be the selected default');
+            const disk=statfsSync(homedir()); const free=Number(disk.bavail)*Number(disk.bsize);
+            assert(free>=6.5*1024**3,'Insufficient actual macOS free disk after VM creation');
+            console.log(JSON.stringify({mode:'MACOS_MACHINE_READY',machine,vmType:selected.VMType,rootless:true,ssh:true,homeBind:true,hostFreeDiskBytes:free}));
+          }
+          console.log(JSON.stringify({mode:'MACOS_MACHINE_STAGE',stage,event:'complete',at:new Date().toISOString(),elapsedMs:Date.now()-started}));
           NODE
-          # Includes VM image download/init, boot and checks; timeout kills its process group.
-          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 285000 node "$RUNNER_TEMP/spaceapp-machine-bootstrap.mjs"
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 300000 node "$RUNNER_TEMP/spaceapp-machine-bootstrap.mjs" initialize
+          if node "$RUNNER_TEMP/spaceapp-bounded.mjs" 285000 node "$RUNNER_TEMP/spaceapp-machine-bootstrap.mjs" boot; then
+            :
+          else
+            boot_status=$?
+            node -e 'console.log(JSON.stringify({mode:"MACOS_MACHINE_STAGE",stage:"boot",event:"failed",at:new Date().toISOString(),code:Number(process.argv[1])}))' "$boot_status"
+            # Scalar state/resource facts only; no SSH paths, keys or raw inspect JSON.
+            node "$RUNNER_TEMP/spaceapp-bounded.mjs" 10000 podman machine inspect \
+              --format '{{.Name}} state={{.State}} cpus={{.Resources.CPUs}} memory={{.Resources.Memory}} rootful={{.Rootful}}' \
+              "$SPACEAPP_MACHINE" || true
+            exit "$boot_status"
+          fi
 
       - name: Run the macOS launcher against the actual Podman machine
         timeout-minutes: 18
