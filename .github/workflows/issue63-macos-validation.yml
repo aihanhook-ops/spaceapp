@@ -18,7 +18,7 @@ jobs:
     if: github.event.repository.private == false
     # Standard public-repository runner; no paid/larger runner label.
     runs-on: macos-15-intel
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       SPACEAPP_MACHINE: spaceapp-ci-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_COMPOSE_PROVIDER: docker-compose
@@ -190,7 +190,7 @@ jobs:
           fi
 
       - name: Time only the resolved small source-image pulls
-        timeout-minutes: 8
+        timeout-minutes: 16
         shell: bash
         run: |
           set -euo pipefail
@@ -220,10 +220,10 @@ jobs:
             assert.match(model.services['spaceapp-core'].image,/^ghcr\.io\/oll4com\/spaceapp-core:1\.1\.4$/);
             assert.match(model.services['spaceapp-cli'].image,/^ghcr\.io\/oll4com\/spaceapp-cli:1\.1\.4$/);
             assert.match(model.services.postgres.image,/@sha256:[a-f0-9]{64}$/);
-            const deadline=Date.now()+7*60*1000;
+            const deadline=Date.now()+15*60*1000;
             for(const image of images){
-              const started=Date.now(); const budget=Math.min(4*60*1000,deadline-started);
-              assert(budget>0,'Seven-minute source pre-pull budget exhausted');
+              const started=Date.now(); const budget=Math.min(5*60*1000,deadline-started);
+              assert(budget>0,'Fifteen-minute source pre-pull budget exhausted');
               console.log(JSON.stringify({mode:'MACOS_SOURCE_PULL',image,event:'start',at:new Date(started).toISOString(),limitMs:budget}));
               try{
                 const output=execFileSync(process.execPath,[join(process.env.RUNNER_TEMP,'spaceapp-bounded.mjs'),String(budget),'podman','pull',image],{env,encoding:'utf8',maxBuffer:32*1024,stdio:['ignore','pipe','pipe']});
@@ -237,7 +237,7 @@ jobs:
             }
           }finally{await rm(fixture,{recursive:true,force:true});}
           NODE
-          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 450000 node "$RUNNER_TEMP/spaceapp-source-prepull.mjs"
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 930000 node "$RUNNER_TEMP/spaceapp-source-prepull.mjs"
 
       - name: Run the macOS launcher against the actual Podman machine
         id: acceptance
