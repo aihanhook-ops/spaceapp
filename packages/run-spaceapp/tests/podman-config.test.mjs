@@ -65,7 +65,7 @@ test("every Podman Compose action retains project identity, profiles, and fixed 
   const stateRoot = join(tmpdir(), "podman-command-staging");
   const actions = ["up", "down", "status", "logs", "pull", "syncCredentials", "installClaude", "backup", "stopForRestore", "resetOwnerPassword", "rotateOwnerSetupToken", "removeBrowser", "removeTemporal", "enableTemporal", "databaseSize", "storageFree", "purge", "repair", "ensureCheckpointDatabase", "checkpointDump", "checkpointRestore", "installProvider", "restore"];
   for (const action of actions) {
-    const options = { profile: "large", companionsEnabled: true, stateRoot, provider: "opencode", backupId: "spaceapp-backup-20260723T120000000Z" };
+    const options = { profile: "large", companionsEnabled: true, stateRoot, provider: "codex", backupId: "spaceapp-backup-20260723T120000000Z" };
     const docker = launcher.composeCommand(action, root, options);
     const podman = launcher.composeCommand(action, root, { ...options, engine: "podman" });
     assert.equal(podman.command, "podman", action);
@@ -81,6 +81,17 @@ test("every Podman Compose action retains project identity, profiles, and fixed 
     assert.equal(docker.command, "docker");
     assert.equal(docker.env, undefined);
   }
+});
+
+test("Podman OpenCode installation verifies the bundled binary while other provider routes stay intact", () => {
+  const root = join(tmpdir(), "podman-provider-home");
+  const suffix = (engine, provider) => launcher.composeCommand("installProvider", root, { engine, provider }).args.slice(-7);
+  assert.deepEqual(suffix("podman", "opencode"), ["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "opencode", "--version"]);
+  for (const [engine, provider] of [["docker", "opencode"], ["podman", "codex"]]) {
+    assert.deepEqual(launcher.composeCommand("installProvider", root, { engine, provider }).args.slice(-8),
+      ["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "node", "/app/deploy/docker/provider-install.mjs", provider]);
+  }
+  assert.throws(() => launcher.composeCommand("installProvider", root, { engine: "podman", provider: "opencode;echo" }), /provider/i);
 });
 
 test("Podman override keeps root entrypoint initialization and per-service secret grants", () => {

@@ -754,7 +754,10 @@ export function composeCommand(action, root, options = {}) {
   };
   if (action === "installProvider") {
     assertProvider(options.provider);
-    actions.installProvider = ["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "node", "/app/deploy/docker/provider-install.mjs", options.provider];
+    actions.installProvider = ["exec", "-T", "--user", "10001:10001", "spaceapp-cli",
+      ...(engine === "podman" && options.provider === "opencode"
+        ? ["opencode", "--version"]
+        : ["node", "/app/deploy/docker/provider-install.mjs", options.provider])];
   }
   let selected = actions[action];
   if (action === "restore") {

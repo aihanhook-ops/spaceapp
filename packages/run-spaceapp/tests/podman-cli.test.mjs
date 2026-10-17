@@ -386,6 +386,22 @@ test("Podman provider, credentials and owner commands retain engine", async (t) 
   assert.ok(f.calls.every(spec => spec.command === "podman"));
 });
 
+test("Podman bundled OpenCode check propagates success and execution failure", async (t) => {
+  const f = await fixture(t);
+  await initializeInstallation(f.root, { engine: "podman", version: "1.1.5", profile: "small" });
+  for (const code of [0, 23]) {
+    const calls = [];
+    assert.equal(await run(["provider", "install", "opencode"], { ...f.options, execute: async (spec) => {
+      calls.push(spec);
+      return code;
+    } }), code);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "podman");
+    assert.deepEqual(calls[0].args.slice(-7), ["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "opencode", "--version"]);
+    assert.ok(!calls[0].args.includes("/app/deploy/docker/provider-install.mjs"));
+  }
+});
+
 test("factory reset preserves the Podman engine", async (t) => {
   const f = await fixture(t);
   await initializeInstallation(f.root, { engine: "podman", version: "1.1.5", profile: "small" });
