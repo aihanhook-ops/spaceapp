@@ -133,13 +133,18 @@ jobs:
           grep -qw memory "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
           mkdir -p "$XDG_RUNTIME_DIR/podman"
           # Use this binary, not the distro unit's older /usr/bin/podman.
-          systemd-run --user --unit=spaceapp-podman-api --collect --property=Delegate=yes \
+          systemd-run --user --unit=spaceapp-podman-api --property=Delegate=yes \
             "$(command -v podman)" system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock"
           for _ in $(seq 1 30); do
             test ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" || break
             sleep 1
           done
-          test -S "$XDG_RUNTIME_DIR/podman/podman.sock"
+          if ! test -S "$XDG_RUNTIME_DIR/podman/podman.sock"; then
+            systemctl --user show spaceapp-podman-api.service \
+              --property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus || true
+            journalctl --user --unit=spaceapp-podman-api.service --boot --no-pager --lines=100 || true
+            exit 1
+          fi
           podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupVersion}} {{.Host.CgroupControllers}}'
 
       - name: Install the supported Compose provider
