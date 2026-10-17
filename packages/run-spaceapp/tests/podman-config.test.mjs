@@ -70,6 +70,9 @@ test("every Podman Compose action retains project identity, profiles, and fixed 
     const podman = launcher.composeCommand(action, root, { ...options, engine: "podman" });
     assert.equal(podman.command, "podman", action);
     assert.deepEqual(podman.env, { PODMAN_COMPOSE_PROVIDER: "docker-compose" });
+    const startsContainer = ["up", "repair", "syncCredentials", "installClaude", "restore"].includes(action);
+    assert.equal(podman.workspaceConfigRoot, startsContainer ? stateRoot : undefined, action);
+    assert.equal(docker.workspaceConfigRoot, undefined, action);
     const overrideIndex = podman.args.indexOf(join(stateRoot, "compose.engine.yml"));
     assert.ok(overrideIndex > 0, action);
     assert.equal(podman.args[overrideIndex - 1], "-f");

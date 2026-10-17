@@ -92,6 +92,12 @@ Register only project directories you own. On SELinux systems, the launcher
 requests shared container labels for these binds, including read-only binds;
 relabeling changes file security labels. Host file ownership is preserved by
 mapping the calling user to the CLI's UID/GID 10001. Keep SELinux enforcing.
+Before starting services with registered workspaces, a temporary read-only
+Podman container validates server-side paths and applies shared labels. It
+uses the selected core image and is removed afterward. Workspace paths with
+commas, double quotes or line breaks are refused because Podman's Compose
+compatibility API cannot carry them safely. Keep registered directories in
+place during startup; a deletion between validation and Compose is not atomic.
 See the [setup and acceptance instructions](https://github.com/oll4com/spaceapp/blob/main/docs/getting-started.md#rootless-podman-linux-and-macos)
 for machine sizing and the separate real-engine proof. CI exercises `small`
 on Ubuntu; macOS, other profiles and SELinux enforcing require their own runs.

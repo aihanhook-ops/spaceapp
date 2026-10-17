@@ -20,6 +20,7 @@ import process from "node:process";
 import {
   addWorkspace,
   applyConfigRepairs,
+  assertPodmanWorkspacePath,
   commitInstallation,
   composeCommand,
   credentialProviders,
@@ -40,6 +41,7 @@ import {
   selectLatestBackupId,
   SPACEAPP_UPGRADE_POLICY,
   upgradePath,
+  validateConfig,
   writeCredential,
   writeRuntimeFiles,
   writeSetupToken
@@ -367,6 +369,16 @@ export async function run(argv, {
     stdout.write(`[PLAN] Preview execution for "${command}" at ${root} (no changes applied).\n`);
     return 0;
   }
+  const originalExecute = execute;
+  execute = async (spec, io) => {
+    if (spec.command === "podman" && spec.workspaceConfigRoot) {
+      const checkCode = await preparePodmanWorkspaceMounts(spec.workspaceConfigRoot, {
+        execute: originalExecute, io, pull: globalFlags.localImages ? "never" : "missing", stderr
+      });
+      if (checkCode !== 0) return checkCode;
+    }
+    return originalExecute(spec, io);
+  };
   if (command === "install") {
     return installCommand(args, {
       root,
@@ -2413,6 +2425,50 @@ export async function readSecret(stdin, stdout, prompt, { mask = true, answerKey
   return await controller.readLine(prompt, { mask, answerKey, defaultValue });
 }
 
+async function preparePodmanWorkspaceMounts(stateRoot, { execute, io, pull, stderr }) {
+  const config = await loadConfig(stateRoot);
+  if (config.workspaces.length === 0) return 0;
+  // Update/rollback write the candidate runtime before committing config.json.
+  const tags = (await readFile(join(stateRoot, "runtime.env"), "utf8")).match(/^SPACEAPP_IMAGE_TAG=.+$/gm) ?? [];
+  if (tags.length !== 1) throw new Error("Podman workspace check requires one runtime image tag.");
+  const { version } = validateConfig({ ...config, version: tags[0].slice("SPACEAPP_IMAGE_TAG=".length) });
+  // shortcut: Compose's Mounts API drops SELinux; remove this helper when it forwards z.
+  // Podman compat also auto-creates missing sources even with create_host_path:false.
+  // Native mounts check server-side paths, but deletion before Compose remains a race.
+  const name = `spaceapp-workspace-check-${randomUUID()}`;
+  const targets = config.workspaces.map((_, index) => `/workspace-check/${index}`);
+  const mounts = config.workspaces.flatMap((workspace, index) => {
+    assertPodmanWorkspacePath(workspace.hostPath);
+    const source = `"source=${workspace.hostPath.replaceAll('"', '""')}"`;
+    return ["--mount", `type=bind,${source},target=${targets[index]},ro=true,relabel=shared`];
+  });
+  const controller = new AbortController();
+  const interrupt = () => controller.abort(new Error("Podman workspace check interrupted."));
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", interrupt);
+  let code, cleanupCode;
+  try {
+    code = await execute({ command: "podman", signal: controller.signal, timeoutMs: 300_000, args: [
+      "run", "--rm", "--name", name, "--pull", pull, "--timeout", "60",
+      "--network", "none", "--read-only", "--no-healthcheck", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+      "--userns", "keep-id:uid=10001,gid=10001", "--user", "10001:10001", "--entrypoint", "node",
+      ...mounts, `ghcr.io/oll4com/spaceapp-core:${version}`, "-e",
+      "const fs=require('node:fs');for(const p of process.argv.slice(1)){if(!fs.statSync(p).isDirectory())throw Error('Workspace source must be a directory');fs.accessSync(p,fs.constants.R_OK|fs.constants.X_OK)}",
+      ...targets
+    ] }, { ...io, stdin: null, input: undefined });
+  } finally {
+    try {
+      cleanupCode = await execute({ command: "podman", args: ["rm", "--force", "--ignore", name], timeoutMs: 15_000 }, { ...io, stdin: null, input: undefined }).catch(() => 1);
+      if (cleanupCode !== 0) stderr.write(`Could not remove Podman workspace check container ${name}.\n`);
+    } finally {
+      process.removeListener("SIGINT", interrupt);
+      process.removeListener("SIGTERM", interrupt);
+    }
+  }
+  if (controller.signal.aborted) throw controller.signal.reason;
+  return code || cleanupCode;
+}
+
 export function executeCommand(spec, { stdin, stdout, stderr, input } = {}) {
   return new Promise((resolve, reject) => {
     if (!spec || typeof spec !== "object" || !trustedCommands.has(spec.command)) {
@@ -2437,19 +2493,28 @@ export function executeCommand(spec, { stdin, stdout, stderr, input } = {}) {
       ? process.env
       : validateCommandEnvironment(spec.env);
     const background = spec.command === 'xdg-open' && spec.background === true;
-    let launchTimer, commandTimer;
+    let launchTimer, commandTimer, abortError;
     const child = spawnTrustedCommand(spec, {
       env: commandEnv,
+      signal: spec.signal,
       shell: false,
       detached: background,
       stdio: background ? ['ignore','ignore','ignore'] : [input === undefined ? (stdin || "inherit") : "pipe", stdout && typeof stdout.fd !== "number" ? "pipe" : stdout || "ignore", stderr && typeof stderr.fd !== "number" ? "pipe" : stderr || "ignore"]
     });
     if (!background && child.stdout && stdout) child.stdout.pipe(stdout, { end: false });
     if (!background && child.stderr && stderr) child.stderr.pipe(stderr, { end: false });
-    if (Number.isFinite(spec.timeoutMs) && spec.timeoutMs > 0) commandTimer = setTimeout(() => child.kill(), spec.timeoutMs);
+    if (Number.isFinite(spec.timeoutMs) && spec.timeoutMs > 0) commandTimer = setTimeout(() => {
+      child.kill();
+      launchTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    }, spec.timeoutMs);
     child.once("error", (error) => {
       clearTimeout(launchTimer);
       clearTimeout(commandTimer);
+      if (error?.code === "ABORT_ERR") {
+        abortError = error;
+        launchTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        return; // Cleanup must wait until the interrupted client has actually closed.
+      }
       if (error?.code === "ENOENT") {
         resolve(127);
       } else {
@@ -2459,6 +2524,7 @@ export function executeCommand(spec, { stdin, stdout, stderr, input } = {}) {
     child.once("close", (code, signal) => {
       clearTimeout(launchTimer);
       clearTimeout(commandTimer);
+      if (abortError) return reject(abortError);
       resolve(code ?? (signal ? 1 : 0));
     });
     if(background)launchTimer=setTimeout(()=>{child.unref();resolve(0);},750);

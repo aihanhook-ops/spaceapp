@@ -112,6 +112,15 @@ Read-only workspaces retain read-only mounts. Relabeling affects file security
 labels, so do not register system directories or your entire home directory.
 Do not disable SELinux or container labeling to make the stack start.
 
+Before creating services that mount workspaces, the launcher runs a temporary
+read-only container from the selected core image to validate the paths on the
+Podman server and apply shared labels. It removes that container afterward.
+Paths containing commas, double quotes or line breaks are refused because
+Podman's Compose compatibility API cannot represent them safely. Spaces,
+colons and equals signs are supported. Do not move or delete registered
+directories during startup: Podman's compatibility API can recreate a source
+deleted between this check and Compose, despite `create_host_path: false`.
+
 The Ubuntu CI job exercises a fresh `small` installation with readiness,
 read-write/read-only workspace ownership, backup/restore, lifecycle commands
 and purge. It uses synthetic state and no provider login or AI requests.

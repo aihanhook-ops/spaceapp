@@ -478,11 +478,18 @@ export function applyConfigRepairs(rawConfig) {
   return validateConfig(repaired);
 }
 
+export function assertPodmanWorkspacePath(hostPath) {
+  if (/[,"\r\n]/.test(hostPath)) {
+    throw new Error("Podman compatibility API cannot safely mount workspace paths containing commas, double quotes or line breaks. Rename the directory or remove that workspace.");
+  }
+}
+
 export async function addWorkspace(config, hostPath, { readOnly = false } = {}) {
   validateConfig(config);
   if (!isAbsolute(hostPath)) {
     throw new Error("Workspace path must be absolute.");
   }
+  if (resolveContainerEngine(config.engine) === "podman") assertPodmanWorkspacePath(hostPath);
   const absolutePath = resolve(hostPath);
   const pathStat = await stat(absolutePath);
   if (!pathStat.isDirectory()) {
@@ -780,6 +787,7 @@ export function composeCommand(action, root, options = {}) {
   return {
     command: engine,
     args: [...base, ...selected],
+    ...(engine === "podman" && ["up", "repair", "syncCredentials", "installClaude", "restore"].includes(action) ? { workspaceConfigRoot: stateRoot } : {}),
     ...(engine === "podman" ? { env: { PODMAN_COMPOSE_PROVIDER: "docker-compose" } } : {})
   };
 }
