@@ -115,18 +115,27 @@ jobs:
           test -x /usr/bin/newgidmap
           grep "^$(id -un):" /etc/subuid
           grep "^$(id -un):" /etc/subgid
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          sudo mkdir -p "/etc/systemd/system/user@$(id -u).service.d"
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | \
+            sudo tee "/etc/systemd/system/user@$(id -u).service.d/50-spaceapp-delegate.conf" > /dev/null
+          sudo systemctl daemon-reload
           sudo loginctl enable-linger "$(id -un)"
-          sudo systemctl start "user@$(id -u).service"
-          sudo systemctl set-property "user@$(id -u).service" Delegate=yes
+          sudo systemctl restart "user@$(id -u).service"
+          test "$(systemctl show "user@$(id -u).service" --property=Delegate --value)" = yes
+          user_cgroup=$(systemctl show "user@$(id -u).service" --property=ControlGroup --value)
+          test -n "$user_cgroup"
+          grep -qw cpu "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
+          grep -qw memory "/sys/fs/cgroup$user_cgroup/cgroup.controllers"
           mkdir -p "$XDG_RUNTIME_DIR/podman"
           # Use this binary, not the distro unit's older /usr/bin/podman.
           systemd-run --user --unit=spaceapp-podman-api --collect --property=Delegate=yes \
             "$(command -v podman)" system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock"
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             test ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" || break
             sleep 1
           done
