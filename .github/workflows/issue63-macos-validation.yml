@@ -1,0 +1,210 @@
+name: Experimental macOS Intel Podman acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/issue63-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-podman-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-podman:
+    if: github.event.repository.private == false
+    # Standard public-repository runner; no paid/larger runner label.
+    runs-on: macos-15-intel
+    timeout-minutes: 35
+    env:
+      SPACEAPP_MACHINE: spaceapp-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      PODMAN_COMPOSE_PROVIDER: docker-compose
+      SPACEAPP_TELEMETRY: "0"
+      LC_ALL: C
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+
+      - name: Prepare bounded commands and check native macOS virtualization
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/spaceapp-bounded.mjs" <<'NODE'
+          import {spawn} from 'node:child_process';
+          const [duration, program, ...args] = process.argv.slice(2);
+          const milliseconds = Number(duration);
+          if (!program || !Number.isFinite(milliseconds) || milliseconds <= 0) throw new Error('Invalid bounded command');
+          const child = spawn(program, args, {shell:false, detached:true, stdio:['ignore','pipe','pipe']});
+          let output = '', expired = false;
+          const collect = chunk => { output = (output + chunk).slice(-16000); };
+          child.stdout.on('data', collect);
+          child.stderr.on('data', collect);
+          const timer = setTimeout(() => {
+            expired = true;
+            try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          }, milliseconds);
+          child.once('error', error => { clearTimeout(timer); console.error(error.message); process.exitCode = 1; });
+          child.once('close', (code, signal) => {
+            clearTimeout(timer);
+            const safe = output.replace(/^.*(?:setup.?token|password|secret|postgres(?:ql)?:\/\/).*$/gim,'[redacted]');
+            if (safe) process.stdout.write(safe.endsWith('\n') ? safe : safe + '\n');
+            if (expired) console.error(`Bounded command exceeded ${milliseconds}ms; experimental environment did not complete.`);
+            else if (signal) console.error(`Bounded command terminated by ${signal}`);
+            process.exitCode = expired ? 124 : code ?? 1;
+          });
+          NODE
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          import {statfsSync} from 'node:fs';
+          import {arch,cpus,homedir,totalmem} from 'node:os';
+          assert.equal(process.platform,'darwin','This proof must run the launcher on macOS');
+          assert.equal(arch(),'x64','The verified installer is Intel-only');
+          assert.notEqual(process.getuid(),0,'Run the launcher and Podman as the runner user');
+          assert.equal(execFileSync('sysctl',['-n','kern.hv_support'],{encoding:'utf8'}).trim(),'1','Native hypervisor unavailable: experimental nested virtualization cannot proceed');
+          assert(cpus().length>=4 && totalmem()>=12*1024**3,'Insufficient host CPU/RAM for the small VM experiment');
+          for (const name of ['CONTAINER_HOST','CONTAINER_CONNECTION','CONTAINERS_MACHINE_PROVIDER','DOCKER_HOST']) assert(!process.env[name],`Unexpected engine override: ${name}`);
+          const disk=statfsSync(homedir()); const free=Number(disk.bavail)*Number(disk.bsize);
+          assert(free>=12*1024**3,'Less than 12 GiB host free disk; no VM or image download attempted');
+          console.log(JSON.stringify({mode:'MACOS_PODMAN_EXPERIMENT',platform:process.platform,arch:arch(),cpus:cpus().length,memoryBytes:totalmem(),hostFreeDiskBytes:free,hypervisor:true}));
+          NODE
+          node --check packages/run-spaceapp/tests/podman-acceptance.mjs
+          node packages/run-spaceapp/tests/podman-acceptance.mjs --self-test
+
+      - name: Install verified Intel Podman and select a supported Compose binary
+        timeout-minutes: 6
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/spaceapp-macos-tools"
+          # Official v5.8.3 asset metadata; Podman 6 removed Intel Mac support.
+          # https://github.com/podman-container-tools/podman/releases/tag/v5.8.3
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 120000 gh release download v5.8.3 \
+            --repo podman-container-tools/podman --pattern podman-installer-macos-amd64.pkg \
+            --dir "$RUNNER_TEMP/spaceapp-macos-tools"
+          package="$RUNNER_TEMP/spaceapp-macos-tools/podman-installer-macos-amd64.pkg"
+          echo "ed6fc5b060ec8d1b9d84cf19725851a3e37480b5003f9c1cafa34b1adfad4de6  $package" | shasum -a 256 --check
+          pkgutil --check-signature "$package" > "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          cat "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          grep -q 'Status: signed by a certificate trusted' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 60000 sudo /usr/sbin/installer -pkg "$package" -target /
+          export PATH="/opt/podman/bin:$PATH"
+          echo /opt/podman/bin >> "$GITHUB_PATH"
+          test "$(podman --version)" = 'podman version 5.8.3'
+          rm "$package"
+          if ! node --input-type=module <<'NODE'
+          import {execFileSync} from 'node:child_process';
+          try {
+            const text=execFileSync('docker-compose',['version','--short'],{encoding:'utf8',timeout:10000});
+            const match=/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(text.trim());
+            if(!match) process.exit(1);
+            const [major,minor,patch]=match.slice(1).map(Number);
+            process.exit(major>2 || major===2 && (minor>24 || minor===24 && patch>=4) ? 0 : 1);
+          } catch { process.exit(1); }
+          NODE
+          then
+            # https://github.com/docker/compose/releases/tag/v2.38.2
+            node "$RUNNER_TEMP/spaceapp-bounded.mjs" 120000 gh release download v2.38.2 \
+              --repo docker/compose --pattern docker-compose-darwin-x86_64 \
+              --dir "$RUNNER_TEMP/spaceapp-macos-tools"
+            echo "2d7ff934f88be52da45e86e5efca286bb879589c0310b025c3c7afd09dfdc82e  $RUNNER_TEMP/spaceapp-macos-tools/docker-compose-darwin-x86_64" | shasum -a 256 --check
+            mv "$RUNNER_TEMP/spaceapp-macos-tools/docker-compose-darwin-x86_64" "$RUNNER_TEMP/spaceapp-macos-tools/docker-compose"
+            chmod +x "$RUNNER_TEMP/spaceapp-macos-tools/docker-compose"
+            export PATH="$RUNNER_TEMP/spaceapp-macos-tools:$PATH"
+            echo "$RUNNER_TEMP/spaceapp-macos-tools" >> "$GITHUB_PATH"
+          fi
+          docker-compose version
+
+      - name: Bound default-provider VM initialization, boot, SSH and home share to five minutes
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/spaceapp-machine-bootstrap.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          import {statfsSync,writeFileSync} from 'node:fs';
+          import {homedir} from 'node:os';
+          import {join} from 'node:path';
+          const machine=process.env.SPACEAPP_MACHINE;
+          assert(/^spaceapp-ci-\d+-\d+$/.test(machine));
+          const capture=(...args)=>execFileSync('podman',args,{encoding:'utf8',maxBuffer:1024*1024});
+          const run=(...args)=>execFileSync('podman',args,{stdio:'inherit'});
+          assert.equal(JSON.parse(capture('machine','list','--format','json')).length,0,'Refusing to change an existing machine/default connection');
+          // No provider override, TCG substitute, helper socket or rootful engine.
+          run('machine','init','--cpus','4','--memory','9216','--disk-size','30','--rootful=false',machine);
+          run('machine','start',machine);
+          assert.equal(capture('machine','ssh',machine,'uname','-s').trim(),'Linux','Guest SSH did not answer');
+          const marker=join(homedir(),`.spaceapp-macos-bind-${machine}`);
+          writeFileSync(marker,machine,{mode:0o600,flag:'wx'});
+          assert.equal(capture('machine','ssh',machine,'cat',marker).trim(),machine,'Default macOS home bind is not accessible in the machine');
+          const info=JSON.parse(capture('info','--format','json'));
+          assert.equal(info.host?.security?.rootless,true);
+          const selected=JSON.parse(capture('machine','list','--format','json')).find(item=>item.Name===machine);
+          assert(selected?.Running && selected?.Default,'The fresh running machine must be the selected default');
+          const disk=statfsSync(homedir()); const free=Number(disk.bavail)*Number(disk.bsize);
+          assert(free>=6.5*1024**3,'Insufficient actual macOS free disk after VM creation');
+          console.log(JSON.stringify({mode:'MACOS_MACHINE_READY',machine,vmType:selected.VMType,rootless:true,ssh:true,homeBind:true,hostFreeDiskBytes:free}));
+          NODE
+          # Includes VM image download/init, boot and checks; timeout kills its process group.
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 285000 node "$RUNNER_TEMP/spaceapp-machine-bootstrap.mjs"
+
+      - name: Run the macOS launcher against the actual Podman machine
+        timeout-minutes: 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 1020000 node \
+            packages/run-spaceapp/tests/podman-acceptance.mjs --profile small \
+            --source-version 1.1.4 --target-version 1.1.5 \
+            --state-file "$RUNNER_TEMP/spaceapp-macos-state.json"
+
+      - name: Always remove only this proof's project, fixture and named machine
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! test -f "$RUNNER_TEMP/spaceapp-bounded.mjs"; then
+            echo 'Bounded tooling was not prepared; no machine creation step could run.'
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/spaceapp-machine-cleanup.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import {spawnSync} from 'node:child_process';
+          import {rmSync} from 'node:fs';
+          import {homedir} from 'node:os';
+          import {join} from 'node:path';
+          const machine=process.env.SPACEAPP_MACHINE;
+          assert(/^spaceapp-ci-\d+-\d+$/.test(machine));
+          let failed=false;
+          const run=(program,args,timeout)=>spawnSync(program,args,{encoding:'utf8',timeout,killSignal:'SIGKILL',maxBuffer:128*1024});
+          const project=run(process.execPath,['packages/run-spaceapp/tests/podman-acceptance.mjs','--cleanup',join(process.env.RUNNER_TEMP,'spaceapp-macos-state.json')],60000);
+          if(project.status!==0){failed=true;console.error('Project cleanup did not finish; named VM removal will still be attempted.');}
+          const available=run('podman',['--version'],10000);
+          if(available.status===0){
+            run('podman',['machine','stop',machine],20000);
+            run('podman',['machine','rm','--force',machine],30000);
+            const listed=run('podman',['machine','list','--format','json'],10000);
+            try {
+              if(listed.status!==0 || JSON.parse(listed.stdout).some(item=>item.Name===machine)) throw new Error('Machine removal not confirmed');
+            } catch {failed=true;console.error('Acceptance machine removal could not be confirmed.');}
+          } else if(available.error?.code!=='ENOENT'){
+            failed=true;console.error('Could not determine whether the acceptance machine remains.');
+          }
+          rmSync(join(homedir(),`.spaceapp-macos-bind-${machine}`),{force:true});
+          console.log(JSON.stringify({mode:'MACOS_EXPERIMENT_CLEANUP',cleaned:!failed,machine}));
+          if(failed)process.exitCode=1;
+          NODE
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 150000 node "$RUNNER_TEMP/spaceapp-machine-cleanup.mjs"
