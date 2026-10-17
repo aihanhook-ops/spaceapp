@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
 import { executeCommand, run } from "../src/cli.mjs";
-import { createDefaultConfig, initializeInstallation, loadConfig } from "../src/index.mjs";
+import { addWorkspace, createDefaultConfig, initializeInstallation, loadConfig, saveConfig } from "../src/index.mjs";
 
 const GiB = 1024 ** 3;
 const resources = { cpuCount: 8, totalMemoryBytes: 32 * GiB, freeDiskBytes: 100 * GiB };
@@ -230,6 +233,144 @@ test("Podman update checkpoints the engine override and recovery retains the eng
   assert.ok(f.calls.every(spec => spec.command === "podman"));
 });
 
+async function workspaceFixture(t) {
+  const f = await fixture(t);
+  await initializeInstallation(f.root, { engine: "podman", version: "1.1.5", profile: "small" });
+  let config = await loadConfig(f.root);
+  for (const [name, readOnly] of [["rw notes", false], ["ro", true]]) {
+    const path = join(f.root, name);
+    await mkdir(path, { mode: 0o700 });
+    await writeFile(join(path, "input"), "private fixture", { mode: 0o600 });
+    config = await addWorkspace(config, path, { readOnly });
+  }
+  await saveConfig(f.root, config);
+  return { ...f, config };
+}
+
+test("Podman prepares exact shared labels on the server with read-only mounts before Compose", async (t) => {
+  const f = await workspaceFixture(t);
+  assert.equal(await run(["up"], f.options), 0);
+  const probe = f.calls.find(spec => spec.args[0] === "run");
+  assert.ok(probe, "a native mount check must precede compatible container creation");
+  assert.ok(f.calls.indexOf(probe) < f.calls.findIndex(spec => spec.args[0] === "compose"));
+  for (const flag of ["--rm", "--read-only", "--no-healthcheck"]) assert.ok(probe.args.includes(flag));
+  for (const [flag, value] of [["--pull", "missing"], ["--network", "none"], ["--cap-drop", "ALL"], ["--user", "10001:10001"], ["--entrypoint", "node"]]) assert.equal(probe.args[probe.args.indexOf(flag) + 1], value);
+  assert.ok(probe.args.includes("ghcr.io/oll4com/spaceapp-core:1.1.5"));
+  for (const [index, workspace] of f.config.workspaces.entries()) {
+    const field = `"source=${workspace.hostPath.replaceAll('"', '""')}"`;
+    assert.ok(probe.args.includes(`type=bind,${field},target=/workspace-check/${index},ro=true,relabel=shared`));
+    if (process.platform !== "win32") {
+      assert.equal((await stat(workspace.hostPath)).mode & 0o777, 0o700);
+      assert.equal((await stat(join(workspace.hostPath, "input"))).mode & 0o777, 0o600);
+      assert.equal((await stat(workspace.hostPath)).uid, process.getuid());
+    }
+  }
+  const name = probe.args[probe.args.indexOf("--name") + 1];
+  assert.match(name, /^spaceapp-workspace-check-[a-f0-9-]+$/);
+  assert.deepEqual(f.calls.find(spec => spec.args[0] === "rm").args, ["rm", "--force", "--ignore", name]);
+  // A synthetic server-side path tests allowed delimiters without Windows-invalid filenames.
+  const specialSource = join(f.root, "notes:=project");
+  await saveConfig(f.root, { ...f.config, workspaces: [{ ...f.config.workspaces[0], hostPath: specialSource }] });
+  const beforeSpecial = f.calls.length;
+  assert.equal(await run(["up"], f.options), 0);
+  const specialProbe = f.calls.slice(beforeSpecial).find(spec => spec.args[0] === "run");
+  assert.ok(specialProbe.args.includes(`type=bind,"source=${specialSource.replaceAll('"', '""')}",target=/workspace-check/0,ro=true,relabel=shared`));
+  for (const suffix of [",U=true", '"', "\r", "\n"]) {
+    const hostPath = `${f.config.workspaces[0].hostPath}${suffix}`;
+    await assert.rejects(addWorkspace(f.config, hostPath), /Podman compatibility API.*workspace paths/i);
+    // Older hand-edited state must also fail before any native relabel or Compose creation.
+    await saveConfig(f.root, { ...f.config, workspaces: [{ ...f.config.workspaces[0], hostPath }] });
+    const calls = f.calls.length;
+    await assert.rejects(run(["up"], f.options), /Podman compatibility API.*workspace paths/i);
+    assert.equal(f.calls.length, calls);
+  }
+  for (const command of ["down", "status"]) assert.equal(await run([command], f.options), 0);
+});
+
+test("workspace check uses the staged candidate runtime during an existing-install upgrade", async (t) => {
+  const f = await workspaceFixture(t);
+  assert.equal(await run(installArgs(["--engine", "podman"]), { ...f.options, runtimeVersion: "1.1.6" }), 0, f.stderr.text());
+  const probes = f.calls.filter(spec => spec.args[0] === "run");
+  assert.equal(probes.length, 1);
+  assert.ok(probes[0].args.includes("ghcr.io/oll4com/spaceapp-core:1.1.6"));
+  assert.equal((await loadConfig(f.root)).version, "1.1.6");
+});
+
+test("a missing remote source blocks Compose and still removes only its native check", async (t) => {
+  const f = await workspaceFixture(t);
+  assert.equal(await run(["up"], { ...f.options, platform: "darwin", execute: async (spec) => {
+    f.calls.push(spec);
+    return spec.args[0] === "run" ? 125 : 0;
+  } }), 125);
+  assert.deepEqual(f.calls.map(spec => spec.args[0]), ["run", "rm"]);
+  for (const command of ["down", "status"]) assert.equal(await run([command], f.options), 0);
+  assert.equal(f.calls.filter(spec => spec.args[0] === "run").length, 1);
+});
+
+test("workspace label check honors local images and cleans up on interruption", async (t) => {
+  const f = await workspaceFixture(t);
+  const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+  await assert.rejects(run(["up", "--local-images"], { ...f.options, execute: async (spec) => {
+    f.calls.push(spec);
+    if (spec.args[0] !== "run") return 0;
+    assert.equal(spec.args[spec.args.indexOf("--pull") + 1], "never");
+    const aborted = new Promise((_, reject) => spec.signal.addEventListener("abort", () => reject(spec.signal.reason), { once: true }));
+    process.emit("SIGTERM");
+    return aborted;
+  } }), /interrupt|abort/i);
+  assert.deepEqual(f.calls.map(spec => spec.args[0]), ["run", "rm"]);
+  assert.deepEqual([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")], listeners);
+});
+
+test("aborted native clients close before command cleanup can proceed", async () => {
+  const originalSpawn = childProcess.spawn;
+  const child = new EventEmitter();
+  let completed = false;
+  childProcess.spawn = () => child;
+  syncBuiltinESMExports();
+  try {
+    const pending = executeCommand({ command: "podman", args: ["run"], signal: new AbortController().signal })
+      .catch(error => { completed = true; return error; });
+    child.emit("error", Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" }));
+    await Promise.resolve();
+    assert.equal(completed, false, "AbortError must not race exact-container cleanup ahead of child close");
+    child.emit("close", null, "SIGTERM");
+    assert.equal((await pending).code, "ABORT_ERR");
+  } finally {
+    child.emit("close", null, "SIGTERM");
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
+});
+
+test("timed native cleanup escalates to SIGKILL even without an abort signal", async () => {
+  const originalSpawn = childProcess.spawn;
+  const originalSetTimeout = globalThis.setTimeout, originalClearTimeout = globalThis.clearTimeout;
+  const child = new EventEmitter(), timers = [], kills = [];
+  child.kill = signal => kills.push(signal ?? "SIGTERM");
+  childProcess.spawn = () => child;
+  globalThis.setTimeout = (callback, delay) => { const timer = { callback, delay }; timers.push(timer); return timer; };
+  globalThis.clearTimeout = () => {};
+  syncBuiltinESMExports();
+  try {
+    const pending = executeCommand({ command: "podman", args: ["rm", "--force", "--ignore", "spaceapp-workspace-check-synthetic"], timeoutMs: 15_000 });
+    assert.equal(timers[0].delay, 15_000);
+    timers[0].callback();
+    assert.deepEqual(kills, ["SIGTERM"]);
+    assert.equal(timers[1]?.delay, 5_000);
+    timers[1].callback();
+    assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+    child.emit("close", null, "SIGKILL");
+    assert.equal(await pending, 1);
+  } finally {
+    child.emit("close", null, "SIGKILL");
+    childProcess.spawn = originalSpawn;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    syncBuiltinESMExports();
+  }
+});
+
 test("Podman provider, credentials and owner commands retain engine", async (t) => {
   const f = await fixture(t);
   await initializeInstallation(f.root, { engine: "podman", version: "1.1.5", profile: "small" });
@@ -281,17 +422,18 @@ test("standalone Podman doctor fails insufficient VM allocation", async (t) => {
 });
 
 test("a successful Podman upgrade and rollback preserve engine and checkpoint files", async (t) => {
-  const f = await fixture(t);
-  await initializeInstallation(f.root, {engine: "podman", version: "1.1.5", profile: "small"});
+  const f = await workspaceFixture(t);
   assert.equal(await run(["update", "1.1.6", "--non-interactive", "--answers", '{"confirm":true}'], f.options), 0, f.stderr.text());
   assert.equal((await loadConfig(f.root)).engine, "podman");
   assert.equal((await loadConfig(f.root)).version, "1.1.6");
+  assert.ok(f.calls.find(spec => spec.args[0] === "run").args.includes("ghcr.io/oll4com/spaceapp-core:1.1.6"));
   const [checkpointId] = await readdir(join(f.root, "checkpoints"));
   assert.ok(await stat(join(f.root, "checkpoints", checkpointId, "verified.json")));
   assert.ok(await stat(join(f.root, "checkpoints", checkpointId, "compose.engine.yml")));
   assert.equal(await run(["rollback", "--non-interactive", "--answers", '{"confirm":true}'], {...f.options, stdin: Readable.from([])}), 0);
   assert.equal((await loadConfig(f.root)).engine, "podman");
   assert.equal((await loadConfig(f.root)).version, "1.1.5");
+  assert.ok(f.calls.findLast(spec => spec.args[0] === "run").args.includes("ghcr.io/oll4com/spaceapp-core:1.1.5"));
   assert.ok(f.calls.every(spec => spec.command === "podman"));
 });
 
