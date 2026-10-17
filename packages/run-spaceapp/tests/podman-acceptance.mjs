@@ -294,7 +294,7 @@ async function acceptance(opts) {
       await core("require('node:assert/strict').equal(require('node:fs').readFileSync('/var/lib/spaceapp/acceptance-marker','utf8'),'before')");
     });
     await phase("lifecycle and diagnostics", async () => {
-      for (const args of [["status"], ["logs"], ["doctor"], ["doctor", "--fix"], ["provider", "install", "claude"], ["down"], ["up"], ["repair"]]) await cli(args);
+      for (const args of [["status"], ["logs"], ["doctor"], ["doctor", "--fix"], ["provider", "install", "opencode"], ["down"], ["up"], ["repair"]]) await cli(args);
       await readiness();
       await cli(["support-bundle", "--out", join(root, "support.json")]);
       const bundle = JSON.parse(await readFile(join(root, "support.json"), "utf8"));

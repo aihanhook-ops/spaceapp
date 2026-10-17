@@ -81,6 +81,9 @@ than treating its virtual disk capacity as free space. Podman is not installed
 or started automatically. Windows and `--access host-root` are unsupported
 with Podman.
 
+`provider install opencode` on Podman verifies the already bundled OpenCode
+binary; it does not download a second copy.
+
 Docker stays the default when it works. A fresh installation can also select
 Podman through `--answers '{"engine":"podman","profile":"small","confirm":true}'`;
 the saved choice is used by later commands. Changing the engine of an existing

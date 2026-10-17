@@ -1881,7 +1881,9 @@ async function providerCommand(args, { root, config, stdin, stdout, stderr, exec
     throw new Error(`Usage: ${UNIVERSAL_COMMAND} provider install <provider>`);
   }
   const provider=args[1];
-  stdout.write(`Installing optional provider ${provider} into this installation's private provider volume.\n`);
+  stdout.write(config.engine === "podman" && provider === "opencode"
+    ? "Checking the bundled OpenCode version.\n"
+    : `Installing optional provider ${provider} into this installation's private provider volume.\n`);
   // Keep the existing Claude path compatible with older runtime images.
   const action=provider === "claude" ? "installClaude" : "installProvider";
   return execute(composeCommand(action, root, { engine: config.engine, profile: config.profile, companionsEnabled: config.companionsEnabled, provider }), { stdin, stdout, stderr });
