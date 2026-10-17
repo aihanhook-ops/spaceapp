@@ -142,8 +142,10 @@ jobs:
               sudo tee /etc/apparmor.d/spaceapp-ci-podman > /dev/null
             sudo apparmor_parser -r /etc/apparmor.d/spaceapp-ci-podman
           fi
+          readlink -f "$(command -v pasta)"
+          pasta --version
           podman_api_started=$(date --iso-8601=seconds)
-          systemd-run --user --unit=spaceapp-podman-api --property=Delegate=yes \
+          systemd-run --user --unit=spaceapp-podman-api --property=Delegate=yes --setenv=PATH="$PATH" \
             "$podman_binary" system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock"
           for _ in $(seq 1 30); do
             test ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" || break
