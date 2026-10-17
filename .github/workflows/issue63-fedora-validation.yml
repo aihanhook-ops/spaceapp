@@ -107,7 +107,8 @@ jobs:
               print('DIAGNOSTIC ' + line)
           PY
             fi
-            if ! python3 "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"; then result=1; fi
+            if ! sudo -n /usr/sbin/runuser -u "$(id -un)" -g kvm -- \
+              /usr/bin/env RUNNER_TEMP="$RUNNER_TEMP" /usr/bin/python3 "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"; then result=1; fi
             printf 'FEDORA_VALIDATION_EXIT=%s stage=%s\n' "$result" "$phase"
             exit "$result"
           }
@@ -252,8 +253,14 @@ jobs:
             kill -0 "$(cat "$work/qemu.pid")"
             sleep 2
           done
+          set +e
           ssh "${ssh_opts[@]}" fedora@127.0.0.1 \
-            'timeout 120s cloud-init status --wait' > "$work/cloud-init.raw" 2>&1
+            'timeout 120s cloud-init status --wait --format json' > "$work/cloud-init.raw" 2>&1
+          cloud_init_result=$?
+          set -e
+          printf 'CLOUD_INIT_EXIT_CODE=%s\n' "$cloud_init_result"
+          # Exit 2 means recoverable errors; classify them from the captured JSON before proceeding.
+          if test "$cloud_init_result" -ne 0; then exit "$cloud_init_result"; fi
           cat > "$work/bootstrap.sh" <<'EOF'
           set -euo pipefail
           test "$(getenforce)" = Enforcing
@@ -331,11 +338,11 @@ jobs:
           scp_opts=(-i "$work/key" -P 2222 -o BatchMode=yes -o IdentitiesOnly=yes \
             -o IdentityAgent=none -o ForwardAgent=no -o StrictHostKeyChecking=yes \
             -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=5)
+          phase=fedora-bootstrap
+          printf 'FEDORA_STAGE=%s\n' "$phase"
           scp "${scp_opts[@]}" "$work/launcher.tar.gz" "$work/docker-compose-linux-x86_64" \
             "$work/bootstrap.sh" "$work/run-proof.sh" "$work/profile" \
             fedora@127.0.0.1:/home/fedora/ > "$work/scp.raw" 2>&1
-          phase=fedora-bootstrap
-          printf 'FEDORA_STAGE=%s\n' "$phase"
           timeout --signal=TERM --kill-after=15s 360s ssh "${ssh_opts[@]}" fedora@127.0.0.1 \
             'sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root bash --noprofile --norc /home/fedora/bootstrap.sh' \
             > "$work/bootstrap.raw" 2>&1
@@ -400,6 +407,7 @@ jobs:
         shell: bash
         run: |
           if test -f "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"; then
-            python3 "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"
+            sudo -n /usr/sbin/runuser -u "$(id -un)" -g kvm -- \
+              /usr/bin/env RUNNER_TEMP="$RUNNER_TEMP" /usr/bin/python3 "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"
             rm "$RUNNER_TEMP/spaceapp-fedora-cleanup.py"
           fi
