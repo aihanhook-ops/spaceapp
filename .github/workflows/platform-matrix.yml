@@ -157,7 +157,7 @@ jobs:
               --grep='apparmor="DENIED".*(comm="podman"|name="/proc/self/exe")' || true
             exit 1
           fi
-          podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupVersion}} {{.Host.CgroupControllers}}'
+          podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupsVersion}} {{.Host.CgroupControllers}}'
 
       - name: Install the supported Compose provider
         shell: bash

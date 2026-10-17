@@ -130,6 +130,68 @@ async function readiness() {
   throw new Error("/readyz did not report ok within ten minutes");
 }
 
+function kernelFactText(value) {
+  return typeof value === "string" ? value.replaceAll(String.fromCharCode(0), "").trim() : null;
+}
+
+function workspaceInspectFacts(data, workspace) {
+  const text = (value) => typeof value === "string" && /^[a-zA-Z0-9_:,.=/-]{0,512}$/.test(value) ? value : null;
+  const mappings = (value) => Array.isArray(value) ? value.filter(item => typeof item === "string" && /^\d+:\d+:\d+$/.test(item)).slice(0, 8) : null;
+  const mount = data.mounts?.find(item => item.Destination === workspace.containerPath);
+  return {
+    usernsMode: text(data.userns), user: text(data.user), processLabel: text(data.processLabel), mountLabel: text(data.mountLabel),
+    uidMap: mappings(data.idMappings?.UidMap), gidMap: mappings(data.idMappings?.GidMap),
+    mount: mount ? {
+      sourceMatches: mount.Source === workspace.hostPath, type: text(mount.Type), rw: typeof mount.RW === "boolean" ? mount.RW : null,
+      options: Array.isArray(mount.Options) ? mount.Options.filter(item => ["z", "Z", "rw", "ro", "rprivate", "private", "rbind", "bind", "nosuid", "nodev", "noexec"].includes(item)) : []
+    } : null
+  };
+}
+
+async function workspaceDiagnostics(root, installation, workspace, env) {
+  const name = basename(workspace.hostPath);
+  assert.equal(dirname(root), homedir());
+  assert(basename(root).startsWith(".spaceapp-podman-acceptance-"));
+  assert.equal(dirname(workspace.hostPath), root);
+  assert(["rw", "ro"].includes(name));
+  assert.equal(workspace.containerPath, `/workspaces/${name}`);
+  const probe = (program, args) => command(program, args, { env, allowFailure: true, cleanup: true, timeoutMs: 10_000 });
+  const ids = (await probe("podman", ["ps", "-aq", "--filter", `label=com.docker.compose.project=${composeProjectName(installation)}`, "--filter", "label=com.docker.compose.service=spaceapp-cli"])).stdout.trim().split(/\s+/);
+  assert.equal(ids.length, 1);
+  assert(/^[a-f0-9]{12,64}$/.test(ids[0]));
+  // Select inspect fields at the engine boundary; never request Config.Env or a full inspect dump.
+  const format = '{"userns":{{json .HostConfig.UsernsMode}},"user":{{json .Config.User}},"idMappings":{{json .HostConfig.IDMappings}},"processLabel":{{json .ProcessLabel}},"mountLabel":{{json .MountLabel}},"mounts":{{json .Mounts}}}';
+  const inspected = await probe("podman", ["inspect", "--format", format, ids[0]]);
+  assert.equal(inspected.code, 0);
+  const hostPaths = [dirname(homedir()), homedir(), root, workspace.hostPath, join(workspace.hostPath, "input")];
+  const hostNames = ["homeParent", "home", "fixtureRoot", "workspace", "input"];
+  const host = [];
+  for (const path of hostPaths) {
+    const entry = await stat(path);
+    host.push({ name: hostNames[host.length], uid: entry.uid, gid: entry.gid, mode: (entry.mode & 0o7777).toString(8) });
+  }
+  let hostLabels = null;
+  if (process.platform === "linux") {
+    const labels = await probe("stat", ["--format=%C", "--", ...hostPaths]);
+    if (labels.code === 0) hostLabels = labels.stdout.trim().split("\n").map(label => /^[a-zA-Z0-9_:,.?-]{1,512}$/.test(label) ? label : null);
+  }
+  const paths = [["root", "/"], ["parent", dirname(workspace.containerPath)], ["workspace", workspace.containerPath], ["input", join(workspace.containerPath, "input")]];
+  const script = `const fs=require('node:fs');const read=p=>{try{return fs.readFileSync(p,'utf8').trim()}catch{return null}};const paths=${JSON.stringify(paths)}.map(([name,path])=>{try{const s=fs.statSync(path);let accessible=true;try{fs.accessSync(path,fs.constants.R_OK|(s.isDirectory()?fs.constants.X_OK:0))}catch{accessible=false}return{name,uid:s.uid,gid:s.gid,mode:(s.mode&0o7777).toString(8),accessible}}catch(e){return{name,error:e.code}}});console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),uidMap:read('/proc/self/uid_map'),gidMap:read('/proc/self/gid_map'),processLabel:read('/proc/self/attr/current'),paths}));`;
+  const executed = await probe("podman", ["exec", "--user", "10001:10001", ids[0], "node", "-e", script]);
+  assert.equal(executed.code, 0);
+  const container = JSON.parse(executed.stdout);
+  container.processLabel = kernelFactText(container.processLabel);
+  assert(Number.isSafeInteger(container.uid) && Number.isSafeInteger(container.gid));
+  for (const key of ["uidMap", "gidMap"]) assert(container[key] === null || /^[\d\s]{1,1024}$/.test(container[key]));
+  assert(container.processLabel === null || /^[a-zA-Z0-9_:,. ()/-]{0,512}$/.test(container.processLabel));
+  assert(Array.isArray(container.paths) && container.paths.length === paths.length);
+  const record = { mode: "WORKSPACE_DIAGNOSTICS", fixture: name, hostUid: process.getuid(), hostGid: process.getgid(), host, hostLabels,
+    inspect: workspaceInspectFacts(JSON.parse(inspected.stdout), workspace), container };
+  const output = JSON.stringify(record);
+  assert(output.length <= 12_000);
+  process.stdout.write(`${output}\n`);
+}
+
 async function acceptance(opts) {
   assert(["linux", "darwin"].includes(process.platform), "Run on Linux or macOS");
   assert.notEqual(process.getuid(), 0, "Run as an unprivileged user");
@@ -198,7 +260,13 @@ async function acceptance(opts) {
       for (const workspace of (await config()).workspaces) {
         const read = `const fs=require('node:fs'),assert=require('node:assert/strict');assert.equal(fs.readFileSync(${JSON.stringify(join(workspace.containerPath, "input"))},'utf8'),'acceptance');`;
         const write = `fs.writeFileSync(${JSON.stringify(join(workspace.containerPath, "output"))},'written');`;
-        await compose(["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "node", "-e", read + (workspace.readOnly ? `assert.throws(()=>{${write}},e=>e.code==='EROFS'||e.code==='EACCES');` : write)]);
+        try {
+          await compose(["exec", "-T", "--user", "10001:10001", "spaceapp-cli", "node", "-e", read + (workspace.readOnly ? `assert.throws(()=>{${write}},e=>e.code==='EROFS'||e.code==='EACCES');` : write)]);
+        } catch (error) {
+          try { if (!interrupted) await workspaceDiagnostics(root, installation, workspace, env); }
+          catch { process.stdout.write('WORKSPACE_DIAGNOSTICS_UNAVAILABLE\n'); }
+          throw error;
+        }
         assert.equal((await stat(join(workspace.hostPath, "input"))).uid, process.getuid());
         if (!workspace.readOnly) {
           const output = await stat(join(workspace.hostPath, "output"));
@@ -272,7 +340,16 @@ async function selfTest() {
   await withCleanup(async () => events.push("success"), async () => events.push("cleanup"));
   assert.deepEqual(events, ["work", "cleanup", "success", "cleanup"]);
   await assert.rejects(withCleanup(async () => { throw new Error("work failed"); }, async () => { throw new Error("cleanup failed"); }), AggregateError);
-  process.stdout.write('SELF_TEST_ONLY: argument validation and failure cleanup passed; no engine was contacted.\n');
+  const workspace = { hostPath: "/fresh/rw", containerPath: "/workspaces/rw" };
+  const diagnostic = workspaceInspectFacts({ userns: "private", user: "0:0", idMappings: { UidMap: ["10001:0:1", "unsafe"] },
+    mounts: [{ Destination: workspace.containerPath, Source: workspace.hostPath, RW: true, Type: "bind", Options: ["z", "PASSWORD_SHOULD_NOT_LEAK"] }],
+    Env: ["PASSWORD_SHOULD_NOT_LEAK"], other: "PASSWORD_SHOULD_NOT_LEAK" }, workspace);
+  assert.equal(diagnostic.mount.sourceMatches, true);
+  assert.deepEqual(diagnostic.uidMap, ["10001:0:1"]);
+  assert.deepEqual(diagnostic.mount.options, ["z"]);
+  assert(!JSON.stringify(diagnostic).includes("PASSWORD_SHOULD_NOT_LEAK"));
+  assert.equal(kernelFactText(`system_u:system_r:container_t:s0${String.fromCharCode(0)}\n`), "system_u:system_r:container_t:s0");
+  process.stdout.write('SELF_TEST_ONLY: argument validation, failure cleanup and diagnostic sanitization passed; no engine was contacted.\n');
 }
 
 try {
