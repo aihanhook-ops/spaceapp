@@ -220,8 +220,10 @@ jobs:
           getfacl --absolute-names /dev/kvm
           sudo setfacl -m "u:$(id -un):rw" /dev/kvm
           getfacl --absolute-names /dev/kvm
-          sudo -u "$(id -un)" -g kvm -- python3 - <<'PY'
+          sudo -n /usr/sbin/runuser -u "$(id -un)" -g kvm -- python3 - <<'PY'
           import fcntl, os, pathlib
+          assert os.geteuid() != 0, 'The QEMU probe must retain an unprivileged UID'
+          assert os.getegid() == os.stat('/dev/kvm').st_gid, 'The probe must use the KVM device group'
           print('KVM_RUNNER_EUID=' + str(os.geteuid()))
           print('KVM_RUNNER_EGID=' + str(os.getegid()))
           print('KVM_RUNNER_LSM=' + pathlib.Path('/proc/self/attr/current').read_text().strip())
@@ -234,7 +236,7 @@ jobs:
           PY
           # Keep the runner UID; use the device's stable group without widening its mode.
           {
-            sudo -u "$(id -un)" -g kvm -- /usr/bin/qemu-system-x86_64 \
+            sudo -n /usr/sbin/runuser -u "$(id -un)" -g kvm -- /usr/bin/qemu-system-x86_64 \
               -daemonize -pidfile "$work/qemu.pid" -name spaceapp-fedora-validation -machine q35,accel=kvm -cpu host \
               -smp 4 -m 12288 -display none -monitor none -serial "file:$work/serial.raw" -no-reboot \
               -drive "file=$work/vm.qcow2,if=virtio,format=qcow2,discard=unmap" \
