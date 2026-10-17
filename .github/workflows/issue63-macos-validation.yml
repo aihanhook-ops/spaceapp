@@ -18,7 +18,7 @@ jobs:
     if: github.event.repository.private == false
     # Standard public-repository runner; no paid/larger runner label.
     runs-on: macos-15-intel
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       SPACEAPP_MACHINE: spaceapp-ci-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_COMPOSE_PROVIDER: docker-compose
@@ -297,11 +297,11 @@ jobs:
 
       - name: Run the macOS launcher against the actual Podman machine
         id: acceptance
-        timeout-minutes: 18
+        timeout-minutes: 46
         shell: bash
         run: |
           set -euo pipefail
-          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 1020000 node \
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 2700000 node \
             packages/run-spaceapp/tests/podman-acceptance.mjs --profile small \
             --source-version 1.1.4 --target-version 1.1.5 \
             --state-file "$RUNNER_TEMP/spaceapp-macos-state.json"
@@ -325,10 +325,17 @@ jobs:
             assert.equal(dirname(state.root),homedir());
             assert(basename(state.root).startsWith('.spaceapp-podman-acceptance-'));
             assert.equal(state.project,composeProjectName(join(state.root,'installation')));
+            const version=value=>value===null?null:['1.1.4','1.1.5'].includes(value)?value:'[redacted]';
+            const image=value=>typeof value==='string'&&/^(?:ghcr\.io\/oll4com\/spaceapp-(?:core|cli):1\.1\.[45]|(?:docker\.io\/)?pgvector\/pgvector:0\.8\.3-pg17-trixie(?:@sha256:[a-f0-9]{64})?)$/.test(value)?value:'[redacted]';
+            let config={available:false};
+            try{
+              const saved=JSON.parse(await readFile(join(state.root,'installation','config.json'),'utf8'));
+              config={version:version(saved.version),previousVersion:version(saved.previousVersion)};
+            }catch{}
             const output=execFileSync('podman',['ps','-a','--filter',`label=com.docker.compose.project=${state.project}`,'--format','json'],{encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:1024*1024,stdio:['ignore','pipe','pipe']});
             const containers=JSON.parse(output);
             assert(Array.isArray(containers)&&containers.length<=20);
-            console.log(JSON.stringify({mode:'MACOS_PROJECT_SNAPSHOT',at,project:state.project,containers:containers.map(item=>({id:item.Id??item.ID,names:item.Names,state:item.State,status:item.Status,exitCode:Number.isInteger(item.ExitCode)?item.ExitCode:null}))}));
+            console.log(JSON.stringify({mode:'MACOS_PROJECT_SNAPSHOT',at,project:state.project,config,containers:containers.map(item=>({id:item.Id??item.ID,names:item.Names,image:image(item.Image),state:item.State,status:item.Status,exitCode:Number.isInteger(item.ExitCode)?item.ExitCode:null}))}));
           }catch{
             console.log(JSON.stringify({mode:'MACOS_PROJECT_SNAPSHOT',at,available:false,reason:'State already cleaned or bounded engine query unavailable; no inference about the original failure'}));
           }

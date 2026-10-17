@@ -192,6 +192,28 @@ async function workspaceDiagnostics(root, installation, workspace, env) {
   process.stdout.write(`${output}\n`);
 }
 
+async function timedOperation(kind, name, work, { now = Date.now, write = (record) => process.stdout.write(`${JSON.stringify(record)}\n`) } = {}) {
+  const names = kind === "phase" ? ["install", "resource limits", "workspaces", "backup and restore", "lifecycle and diagnostics", "update checkpoint and rollback", "uninstall and purge"]
+    : kind === "operation" ? ["update-cli", "target-readiness", "rollback-cli", "source-readiness"] : [];
+  assert(names.includes(name), "Unknown timing operation");
+  const started = now();
+  const emit = (event) => {
+    try {
+      const current = now(), elapsedMs = Math.max(0, current - started);
+      if (Number.isFinite(elapsedMs)) write({ mode: "PODMAN_ACCEPTANCE_TIMING", kind, name, event, at: new Date(current).toISOString(), elapsedMs });
+    } catch {} // Diagnostics must not replace the callback's result or original failure.
+  };
+  emit("start");
+  try {
+    const result = await work();
+    emit("complete");
+    return result;
+  } catch (error) {
+    emit("failure");
+    throw error;
+  }
+}
+
 async function acceptance(opts) {
   assert(["linux", "darwin"].includes(process.platform), "Run on Linux or macOS");
   assert.notEqual(process.getuid(), 0, "Run as an unprivileged user");
@@ -224,7 +246,7 @@ async function acceptance(opts) {
   }
   const passed = [];
   let appliedLimits;
-  const phase = async (name, work) => { process.stdout.write(`Podman acceptance: ${name}\n`); await work(); passed.push(name); };
+  const phase = async (name, work) => { process.stdout.write(`Podman acceptance: ${name}\n`); await timedOperation("phase", name, work); passed.push(name); };
   await withCleanup(async () => {
     env.SPACEAPP_HOME = installation;
     const answers = JSON.stringify({ confirm: true, profile: opts.profile, engine: "podman", access: "isolated", companions: false, telemetry: false, open: false });
@@ -307,15 +329,15 @@ async function acceptance(opts) {
       assert.equal((await config()).engine, "podman");
     });
     if (opts.targetVersion) await phase("update checkpoint and rollback", async () => {
-      await cli(["update", opts.targetVersion], { version: opts.targetVersion });
+      await timedOperation("operation", "update-cli", () => cli(["update", opts.targetVersion], { version: opts.targetVersion }));
       assert.equal((await config()).version, opts.targetVersion);
       assert.equal((await config()).previousVersion, opts.sourceVersion);
       assert((await readdir(join(installation, "checkpoints"))).length > 0, "Update must create a checkpoint");
-      await readiness();
-      await cli(["rollback"], { version: opts.targetVersion });
+      await timedOperation("operation", "target-readiness", readiness);
+      await timedOperation("operation", "rollback-cli", () => cli(["rollback"], { version: opts.targetVersion }));
       assert.equal((await config()).version, opts.sourceVersion);
       assert.equal((await config()).engine, "podman");
-      await readiness();
+      await timedOperation("operation", "source-readiness", readiness);
     });
     await phase("uninstall and purge", async () => {
       await cli(["uninstall"]);
@@ -349,6 +371,25 @@ async function selfTest() {
   assert.deepEqual(diagnostic.mount.options, ["z"]);
   assert(!JSON.stringify(diagnostic).includes("PASSWORD_SHOULD_NOT_LEAK"));
   assert.equal(kernelFactText(`system_u:system_r:container_t:s0${String.fromCharCode(0)}\n`), "system_u:system_r:container_t:s0");
+  const timing = [], timingOrder = [];
+  let clock = Date.parse("2026-01-01T00:00:00.000Z");
+  const timingOptions = { now: () => clock, write: (record) => { timing.push(record); timingOrder.push(record.event); } };
+  const privateResult = { output: "PASSWORD_SHOULD_NOT_LEAK", args: ["TOKEN_SHOULD_NOT_LEAK"], env: { secret: "SECRET_SHOULD_NOT_LEAK" } };
+  assert.equal(await timedOperation("operation", "update-cli", async () => { timingOrder.push("work"); clock += 250; return privateResult; }, timingOptions), privateResult);
+  assert.deepEqual(timingOrder, ["start", "work", "complete"]);
+  const privateFailure = Object.assign(new Error("PASSWORD_SHOULD_NOT_LEAK"), privateResult);
+  await assert.rejects(timedOperation("operation", "rollback-cli", async () => { timingOrder.push("failing work"); clock += 75; throw privateFailure; }, timingOptions), (error) => error === privateFailure);
+  assert.deepEqual(timingOrder, ["start", "work", "complete", "start", "failing work", "failure"]);
+  assert.deepEqual(timing.map(({ elapsedMs }) => elapsedMs), [0, 250, 0, 75]);
+  for (const record of timing) {
+    assert.deepEqual(Object.keys(record), ["mode", "kind", "name", "event", "at", "elapsedMs"]);
+    assert.equal(record.mode, "PODMAN_ACCEPTANCE_TIMING");
+    assert.equal(new Date(record.at).toISOString(), record.at);
+    assert(Number.isFinite(record.elapsedMs) && record.elapsedMs >= 0);
+  }
+  assert(!/PASSWORD_SHOULD_NOT_LEAK|TOKEN_SHOULD_NOT_LEAK|SECRET_SHOULD_NOT_LEAK/.test(JSON.stringify(timing)));
+  await assert.rejects(timedOperation("operation", "update-cli", async () => { throw privateFailure; }, { write: () => { throw new Error("diagnostic write failed"); } }), (error) => error === privateFailure);
+  await assert.rejects(timedOperation("operation", "PASSWORD_SHOULD_NOT_LEAK", async () => { throw new Error("Unknown names must not execute"); }), /Unknown timing operation/);
   process.stdout.write('SELF_TEST_ONLY: argument validation, failure cleanup and diagnostic sanitization passed; no engine was contacted.\n');
 }
 
