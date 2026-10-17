@@ -80,7 +80,7 @@ jobs:
             trap - EXIT INT TERM
             if test "$result" -ne 0; then
               if test "$phase" = fedora-boot; then
-                sudo journalctl --kernel --no-pager -n 200 \
+                sudo journalctl -k --no-pager -n 200 \
                   --grep='apparmor="DENIED".*(qemu|/dev/kvm)|comm="qemu-system' 2>&1 | \
                   tee "$work/kvm-audit.raw" > /dev/null || true
               fi
@@ -220,9 +220,10 @@ jobs:
           getfacl --absolute-names /dev/kvm
           sudo setfacl -m "u:$(id -un):rw" /dev/kvm
           getfacl --absolute-names /dev/kvm
-          python3 - <<'PY'
+          sudo -u "$(id -un)" -g kvm -- python3 - <<'PY'
           import fcntl, os, pathlib
           print('KVM_RUNNER_EUID=' + str(os.geteuid()))
+          print('KVM_RUNNER_EGID=' + str(os.getegid()))
           print('KVM_RUNNER_LSM=' + pathlib.Path('/proc/self/attr/current').read_text().strip())
           fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
           assert fcntl.ioctl(fd, 0xAE00, 0) == 12
@@ -231,13 +232,16 @@ jobs:
           os.close(fd)
           print('KVM_RUNNER_API=12 KVM_CREATE_VM=passed')
           PY
-          /usr/bin/qemu-system-x86_64 -name spaceapp-fedora-validation -machine q35,accel=kvm -cpu host \
-            -smp 4 -m 12288 -display none -monitor none -serial "file:$work/serial.raw" -no-reboot \
-            -drive "file=$work/vm.qcow2,if=virtio,format=qcow2,discard=unmap" \
-            -drive "file=$work/seed.iso,if=virtio,format=raw,readonly=on" \
-            -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22 \
-            > "$work/qemu.raw" 2>&1 &
-          echo "$!" > "$work/qemu.pid"
+          # Keep the runner UID; use the device's stable group without widening its mode.
+          {
+            sudo -u "$(id -un)" -g kvm -- /usr/bin/qemu-system-x86_64 \
+              -daemonize -pidfile "$work/qemu.pid" -name spaceapp-fedora-validation -machine q35,accel=kvm -cpu host \
+              -smp 4 -m 12288 -display none -monitor none -serial "file:$work/serial.raw" -no-reboot \
+              -drive "file=$work/vm.qcow2,if=virtio,format=qcow2,discard=unmap" \
+              -drive "file=$work/seed.iso,if=virtio,format=raw,readonly=on" \
+              -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22
+          } > "$work/qemu.raw" 2>&1
+          test -s "$work/qemu.pid"
           ssh_opts=(-i "$work/key" -p 2222 -o BatchMode=yes -o IdentitiesOnly=yes \
             -o IdentityAgent=none -o ForwardAgent=no -o StrictHostKeyChecking=accept-new \
             -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=5)
