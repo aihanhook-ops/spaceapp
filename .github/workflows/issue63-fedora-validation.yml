@@ -198,6 +198,7 @@ jobs:
           ssh-keygen -q -t ed25519 -N '' -f "$work/key"
           cat > "$work/user-data" <<'EOF'
           #cloud-config
+          preserve_hostname: true
           disable_root: true
           ssh_pwauth: false
           users:
@@ -209,7 +210,7 @@ jobs:
               ssh_authorized_keys:
           EOF
           printf '      - %s\n' "$(cat "$work/key.pub")" >> "$work/user-data"
-          printf 'instance-id: spaceapp-fedora-validation\nlocal-hostname: spaceapp-fedora\n' > "$work/meta-data"
+          printf 'instance-id: spaceapp-fedora-validation\n' > "$work/meta-data"
           cloud-localds "$work/seed.iso" "$work/user-data" "$work/meta-data"
           qemu-img create -q -f qcow2 -F qcow2 -b "$work/$image" "$work/vm.qcow2" 20G
           phase=fedora-boot
