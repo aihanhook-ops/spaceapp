@@ -88,13 +88,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/spaceapp-macos-tools"
-          # Official v5.8.3 asset metadata; Podman 6 removed Intel Mac support.
-          # https://github.com/podman-container-tools/podman/releases/tag/v5.8.3
-          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 120000 gh release download v5.8.3 \
+          # Official v5.8.9 Intel asset; the actual machine version is checked before acceptance.
+          # https://github.com/podman-container-tools/podman/releases/tag/v5.8.9
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 120000 gh release download v5.8.9 \
             --repo podman-container-tools/podman --pattern podman-installer-macos-amd64.pkg \
             --dir "$RUNNER_TEMP/spaceapp-macos-tools"
           package="$RUNNER_TEMP/spaceapp-macos-tools/podman-installer-macos-amd64.pkg"
-          echo "ed6fc5b060ec8d1b9d84cf19725851a3e37480b5003f9c1cafa34b1adfad4de6  $package" | shasum -a 256 --check
+          echo "3d600c6a1efd41445b56ed9864b9daba0765cfeae9d62604e87cf6c01b613403  $package" | shasum -a 256 --check
           pkgutil --check-signature "$package" > "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
           cat "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
           grep -q 'Status: signed by a developer certificate issued by Apple for distribution' "$RUNNER_TEMP/spaceapp-pkg-signature.txt"
@@ -112,7 +112,7 @@ jobs:
           node "$RUNNER_TEMP/spaceapp-bounded.mjs" 60000 sudo /usr/sbin/installer -pkg "$package" -target /
           export PATH="/opt/podman/bin:$PATH"
           echo /opt/podman/bin >> "$GITHUB_PATH"
-          test "$(podman --version)" = 'podman version 5.8.3'
+          test "$(podman --version)" = 'podman version 5.8.9'
           rm "$package"
           if ! node --input-type=module <<'NODE'
           import {execFileSync} from 'node:child_process';
@@ -188,6 +188,23 @@ jobs:
               "$SPACEAPP_MACHINE" || true
             exit "$boot_status"
           fi
+
+      - name: Require matching actual Podman client and machine versions
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/spaceapp-matching-versions.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          const versions=JSON.parse(execFileSync('podman',['version','--format','json'],{encoding:'utf8',timeout:8000,killSignal:'SIGKILL',maxBuffer:128*1024,stdio:['ignore','pipe','pipe']}));
+          const clientVersion=versions.Client?.Version,serverVersion=versions.Server?.Version;
+          for(const version of [clientVersion,serverVersion]) assert(typeof version==='string'&&/^\d+\.\d+\.\d+$/.test(version),'Missing or invalid actual Podman client/server version');
+          console.log(JSON.stringify({mode:'MACOS_PODMAN_VERSIONS',clientVersion,serverVersion,matched:clientVersion===serverVersion}));
+          assert.equal(clientVersion,'5.8.9','Unexpected verified Podman client');
+          assert.equal(serverVersion,clientVersion,'Podman client/server versions must match before acceptance');
+          NODE
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 10000 node "$RUNNER_TEMP/spaceapp-matching-versions.mjs"
 
       - name: Time only the resolved small source-image pulls
         timeout-minutes: 46
