@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdtemp, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -194,7 +195,7 @@ async function workspaceDiagnostics(root, installation, workspace, env) {
 
 async function timedOperation(kind, name, work, { now = Date.now, write = (record) => process.stdout.write(`${JSON.stringify(record)}\n`) } = {}) {
   const names = kind === "phase" ? ["install", "resource limits", "workspaces", "backup and restore", "lifecycle and diagnostics", "update checkpoint and rollback", "uninstall and purge"]
-    : kind === "operation" ? ["update-cli", "target-readiness", "rollback-cli", "source-readiness"] : [];
+    : kind === "operation" ? ["update-cli", "target-readiness", "rollback-cli", "source-readiness"] : kind === "compose" ? COMPOSE_TIMING_ACTIONS : [];
   assert(names.includes(name), "Unknown timing operation");
   const started = now();
   const emit = (event) => {
@@ -212,6 +213,55 @@ async function timedOperation(kind, name, work, { now = Date.now, write = (recor
     emit("failure");
     throw error;
   }
+}
+
+const COMPOSE_TIMING_ACTIONS = ["pull", "up", "stop", "exec", "ps", "logs", "run", "rm", "down", "config", "version", "other"];
+function cliTimeoutMs(platform, action) { return (platform === "darwin" && ["update", "rollback"].includes(action) ? 30 : 15) * 60_000; }
+function composeTimingAction(spec) {
+  if (spec?.command !== "podman" || !Array.isArray(spec.args) || spec.args[0] !== "compose") return null;
+  const flags = ["--project-name", "-p", "--project-directory", "--env-file", "-f", "--file", "--profile", "--ansi", "--progress", "--parallel"];
+  let index = 1;
+  while (flags.includes(spec.args[index])) index += 2;
+  return COMPOSE_TIMING_ACTIONS.includes(spec.args[index]) ? spec.args[index] : "other";
+}
+function traceComposeExecute(execute, write) {
+  return (spec, io) => {
+    const action = composeTimingAction(spec);
+    return action === null ? execute(spec, io) : timedOperation("compose", action, () => execute(spec, io), { write });
+  };
+}
+async function replayComposeTrace(root, action, write = (record) => process.stdout.write(`${JSON.stringify(record)}\n`)) {
+  let file;
+  try {
+    assert(["update", "rollback"].includes(action));
+    assert.equal(dirname(root), homedir());
+    assert(basename(root).startsWith(".spaceapp-podman-acceptance-"));
+    file = await open(join(root, `${action}-compose-timing.jsonl`), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const metadata = await file.stat();
+    assert(metadata.isFile() && metadata.uid === process.getuid() && (metadata.mode & 0o777) === 0o600 && metadata.size <= 64 * 1024);
+    const content = await file.readFile("utf8");
+    assert(Buffer.byteLength(content) <= 64 * 1024);
+    const lines = content.split("\n");
+    for (let index = 0; index < lines.length; index++) {
+      if (index === lines.length - 1 && !lines[index]) break;
+      let record;
+      try { record = JSON.parse(lines[index]); }
+      catch (error) { if (index === lines.length - 1 && !content.endsWith("\n")) break; throw error; }
+      assert.deepEqual(Object.keys(record).sort(), ["at", "elapsedMs", "event", "kind", "mode", "name"]);
+      assert(record.mode === "PODMAN_ACCEPTANCE_TIMING" && record.kind === "compose" && COMPOSE_TIMING_ACTIONS.includes(record.name));
+      assert(["start", "complete", "failure"].includes(record.event) && typeof record.at === "string" && new Date(record.at).toISOString() === record.at);
+      assert(Number.isFinite(record.elapsedMs) && record.elapsedMs >= 0);
+      write({ mode: "PODMAN_ACCEPTANCE_TIMING", kind: "compose", name: record.name, event: record.event, at: record.at, elapsedMs: record.elapsedMs });
+    }
+  } catch {
+    try { write({ mode: "PODMAN_COMPOSE_TRACE_UNAVAILABLE" }); } catch {}
+  } finally { await file?.close().catch(() => {}); }
+}
+function composeTracingSource(trace) {
+  return `import assert from "node:assert/strict"; import {appendFileSync,constants as fsConstants} from "node:fs";
+    const COMPOSE_TIMING_ACTIONS=${JSON.stringify(COMPOSE_TIMING_ACTIONS)};
+    ${timedOperation.toString()} ${composeTimingAction.toString()} ${traceComposeExecute.toString()}
+    const execute=traceComposeExecute(executeCommand,record=>appendFileSync(${JSON.stringify(trace)},JSON.stringify(record)+"\\n",{flag:fsConstants.O_WRONLY|fsConstants.O_APPEND|fsConstants.O_NOFOLLOW}));`;
 }
 
 async function acceptance(opts) {
@@ -235,6 +285,11 @@ async function acceptance(opts) {
   const diskFloor = { small: 6.5, medium: 8, large: 11 }[opts.profile] * 1024 ** 3;
   assert(engineInfo.checks.every((check) => check.ok), `Unsupported Podman prerequisites: ${engineInfo.checks.filter((check) => !check.ok).map((check) => check.name).join(", ")}`);
   assert(Number.isFinite(engineInfo.freeDiskBytes) && engineInfo.freeDiskBytes >= diskFloor, "Insufficient or unknown free engine disk; no acceptance state was created");
+  const finiteFact = (value) => Number.isFinite(value) && value >= 0 ? value : null;
+  process.stdout.write(`${JSON.stringify({ mode: "PODMAN_ACCEPTANCE_RESOURCES", at: new Date().toISOString(),
+    storageDriver: ["overlay", "vfs"].includes(facts.store?.graphDriverName) ? facts.store.graphDriverName : "unknown",
+    cpuCount: finiteFact(facts.host?.cpus), memoryBytes: finiteFact(facts.host?.memTotal), freeDiskBytes: finiteFact(engineInfo.freeDiskBytes),
+    engineVersion: /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(facts.version?.Version) ? facts.version.Version : null })}\n`);
   const root = await mkdtemp(join(homedir(), ".spaceapp-podman-acceptance-"));
   const installation = join(root, "installation");
   const stateFile = opts.stateFile ?? `${root}.json`;
@@ -250,9 +305,17 @@ async function acceptance(opts) {
   await withCleanup(async () => {
     env.SPACEAPP_HOME = installation;
     const answers = JSON.stringify({ confirm: true, profile: opts.profile, engine: "podman", access: "isolated", companions: false, telemetry: false, open: false });
-    const cli = (args, { version = opts.sourceVersion, input } = {}) => {
-      const script = `import {run} from ${JSON.stringify(new URL("../src/cli.mjs", import.meta.url).href)}; try { process.exitCode = await run(process.argv.slice(1), {runtimeVersion:${JSON.stringify(version)}}); } catch(error) { console.error(error.message); process.exitCode=1; }`;
-      return command(process.execPath, ["--input-type=module", "-e", script, ...args, ...(input ? [] : ["--non-interactive"]), "--answers", answers], { env, input });
+    const cli = async (args, { version = opts.sourceVersion, input } = {}) => {
+      let trace;
+      if (process.platform === "darwin" && ["update", "rollback"].includes(args[0])) {
+        try { trace = join(root, `${args[0]}-compose-timing.jsonl`); await writeFile(trace, "", { mode: 0o600, flag: "wx" }); }
+        catch { trace = null; try { process.stdout.write(`${JSON.stringify({ mode: "PODMAN_COMPOSE_TRACE_UNAVAILABLE" })}\n`); } catch {} }
+      }
+      const tracing = trace ? composeTracingSource(trace) : "";
+      const script = `import {run,executeCommand} from ${JSON.stringify(new URL("../src/cli.mjs", import.meta.url).href)}; ${tracing} try { process.exitCode = await run(process.argv.slice(1), {runtimeVersion:${JSON.stringify(version)}${trace ? ",execute" : ""}}); } catch(error) { console.error(error.message); process.exitCode=1; }`;
+      try {
+        return await command(process.execPath, ["--input-type=module", "-e", script, ...args, ...(input ? [] : ["--non-interactive"]), "--answers", answers], { env, input, timeoutMs: cliTimeoutMs(process.platform, args[0]) });
+      } finally { if (trace) await replayComposeTrace(root, args[0]); }
     };
     const config = async () => JSON.parse(await readFile(join(installation, "config.json"), "utf8"));
     const compose = async (args) => {
@@ -329,15 +392,18 @@ async function acceptance(opts) {
       assert.equal((await config()).engine, "podman");
     });
     if (opts.targetVersion) await phase("update checkpoint and rollback", async () => {
+      await core("require('node:fs').writeFileSync('/var/lib/spaceapp/acceptance-marker','before-update')");
       await timedOperation("operation", "update-cli", () => cli(["update", opts.targetVersion], { version: opts.targetVersion }));
       assert.equal((await config()).version, opts.targetVersion);
       assert.equal((await config()).previousVersion, opts.sourceVersion);
       assert((await readdir(join(installation, "checkpoints"))).length > 0, "Update must create a checkpoint");
       await timedOperation("operation", "target-readiness", readiness);
+      await core("const fs=require('node:fs');require('node:assert/strict').equal(fs.readFileSync('/var/lib/spaceapp/acceptance-marker','utf8'),'before-update');fs.writeFileSync('/var/lib/spaceapp/acceptance-marker','after-update')");
       await timedOperation("operation", "rollback-cli", () => cli(["rollback"], { version: opts.targetVersion }));
       assert.equal((await config()).version, opts.sourceVersion);
       assert.equal((await config()).engine, "podman");
       await timedOperation("operation", "source-readiness", readiness);
+      await core("require('node:assert/strict').equal(require('node:fs').readFileSync('/var/lib/spaceapp/acceptance-marker','utf8'),'after-update')");
     });
     await phase("uninstall and purge", async () => {
       await cli(["uninstall"]);
@@ -390,6 +456,54 @@ async function selfTest() {
   assert(!/PASSWORD_SHOULD_NOT_LEAK|TOKEN_SHOULD_NOT_LEAK|SECRET_SHOULD_NOT_LEAK/.test(JSON.stringify(timing)));
   await assert.rejects(timedOperation("operation", "update-cli", async () => { throw privateFailure; }, { write: () => { throw new Error("diagnostic write failed"); } }), (error) => error === privateFailure);
   await assert.rejects(timedOperation("operation", "PASSWORD_SHOULD_NOT_LEAK", async () => { throw new Error("Unknown names must not execute"); }), /Unknown timing operation/);
+  for (const action of ["update", "rollback"]) {
+    assert.equal(cliTimeoutMs("darwin", action), 30 * 60_000);
+    assert.equal(cliTimeoutMs("linux", action), 15 * 60_000);
+  }
+  assert.equal(cliTimeoutMs("darwin", "install"), 15 * 60_000);
+  assert.equal(cliTimeoutMs("darwin", "up"), 15 * 60_000);
+  const composeSpec = { command: "podman", args: ["compose", "--project-name", "pull", "--project-directory", "stop", "--env-file", "exec", "-f", "up", "--profile", "down", "up", "-d"] };
+  assert.equal(composeTimingAction(composeSpec), "up");
+  assert.equal(composeTimingAction({ command: "podman", args: ["compose", "PASSWORD_SHOULD_NOT_LEAK"] }), "other");
+  for (const spec of [{ command: "docker", args: ["compose", "up"] }, { command: "podman", args: ["run", "PASSWORD_SHOULD_NOT_LEAK"] }]) assert.equal(composeTimingAction(spec), null);
+  const composeRecords = [], passthroughIO = { input: "PASSWORD_SHOULD_NOT_LEAK" };
+  const wrapped = traceComposeExecute(async (spec, io) => { assert.equal(spec, composeSpec); assert.equal(io, passthroughIO); return 23; }, (record) => composeRecords.push(record));
+  assert.equal(await wrapped(composeSpec, passthroughIO), 23);
+  assert.deepEqual(composeRecords.map(({ event }) => event), ["start", "complete"]);
+  await assert.rejects(traceComposeExecute(async () => { throw privateFailure; }, (record) => composeRecords.push(record))(composeSpec, passthroughIO), (error) => error === privateFailure);
+  assert.deepEqual(composeRecords.map(({ event }) => event), ["start", "complete", "start", "failure"]);
+  const nativeSpec = { command: "podman", args: ["run", "PASSWORD_SHOULD_NOT_LEAK"] };
+  assert.equal(await traceComposeExecute(async (spec, io) => { assert.equal(spec, nativeSpec); assert.equal(io, passthroughIO); return 23; }, () => { throw new Error("Native calls must not emit Compose records"); })(nativeSpec, passthroughIO), 23);
+  assert(!JSON.stringify(composeRecords).includes("PASSWORD_SHOULD_NOT_LEAK"));
+  if (process.platform !== "win32") {
+    const traceRoot = await mkdtemp(join(homedir(), ".spaceapp-podman-acceptance-trace-test-"));
+    const replayed = [];
+    try {
+      for (const action of ["update", "rollback"]) {
+        const trace = join(traceRoot, `${action}-compose-timing.jsonl`);
+        await writeFile(trace, "", { mode: 0o600, flag: "wx" });
+        const script = `const failure=new Error('PASSWORD_SHOULD_NOT_LEAK');const executeCommand=async()=>{${action === "rollback" ? "throw failure" : "return 23"}};
+          ${composeTracingSource(trace)}
+          try { const value=await execute(${JSON.stringify(composeSpec)},${JSON.stringify(passthroughIO)});assert.equal(value,23); } catch(error) { assert.equal(error,failure);process.exitCode=23; }
+          process.stdout.write('PASSWORD_SHOULD_NOT_LEAK');`;
+        const child = await command(process.execPath, ["--input-type=module", "-e", script], { allowFailure: true });
+        assert.equal(child.code, action === "rollback" ? 23 : 0);
+        assert.equal(child.stdout, "PASSWORD_SHOULD_NOT_LEAK");
+        await replayComposeTrace(traceRoot, action, (record) => replayed.push(record));
+      }
+      assert.deepEqual(replayed.map(({ event }) => event), ["start", "complete", "start", "failure"]);
+      assert(!JSON.stringify(replayed).includes("PASSWORD_SHOULD_NOT_LEAK"));
+      replayed.length = 0;
+      await writeFile(join(traceRoot, "update-compose-timing.jsonl"), `${composeRecords.map((record) => JSON.stringify(record)).join("\n")}\n{"unfinished":`);
+      await replayComposeTrace(traceRoot, "update", (record) => replayed.push(record));
+      assert.deepEqual(replayed, composeRecords, "A killed child's incomplete final line must not discard completed safe records");
+      await writeFile(join(traceRoot, "rollback-compose-timing.jsonl"), `${JSON.stringify({ ...composeRecords[0], output: "PASSWORD_SHOULD_NOT_LEAK" })}\n`);
+      await replayComposeTrace(traceRoot, "rollback", (record) => replayed.push(record));
+      assert.equal(replayed.at(-1).mode, "PODMAN_COMPOSE_TRACE_UNAVAILABLE");
+      assert(!JSON.stringify(replayed).includes("PASSWORD_SHOULD_NOT_LEAK"));
+      await replayComposeTrace(traceRoot, "update", () => { throw privateFailure; });
+    } finally { await rm(traceRoot, { recursive: true, force: true }); }
+  }
   process.stdout.write('SELF_TEST_ONLY: argument validation, failure cleanup and diagnostic sanitization passed; no engine was contacted.\n');
 }
 

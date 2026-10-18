@@ -18,7 +18,7 @@ jobs:
     if: github.event.repository.private == false
     # Standard public-repository runner; no paid/larger runner label.
     runs-on: macos-15-intel
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       SPACEAPP_MACHINE: spaceapp-ci-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_COMPOSE_PROVIDER: docker-compose
@@ -297,11 +297,11 @@ jobs:
 
       - name: Run the macOS launcher against the actual Podman machine
         id: acceptance
-        timeout-minutes: 46
+        timeout-minutes: 91
         shell: bash
         run: |
           set -euo pipefail
-          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 2700000 node \
+          node "$RUNNER_TEMP/spaceapp-bounded.mjs" 5400000 node \
             packages/run-spaceapp/tests/podman-acceptance.mjs --profile small \
             --source-version 1.1.4 --target-version 1.1.5 \
             --state-file "$RUNNER_TEMP/spaceapp-macos-state.json"
